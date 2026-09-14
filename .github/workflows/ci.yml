@@ -8,10 +8,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install -r requirements.txt pytest
-      - run: pytest -q
-      - run: python -m compileall -q app
+      - name: Clone repository
+        run: git clone --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" .
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python3 -m pytest -q
+      - name: Compile Python sources
+        run: python3 -m compileall -q app
