@@ -1,0 +1,13 @@
+services:
+  deepscout:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SEARXNG_URL: "${SEARXNG_URL:-http://host.docker.internal:8888}"
+      DEEPSCOUT_DB: /app/data/deepscout.db
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
