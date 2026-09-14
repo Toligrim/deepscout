@@ -31,7 +31,7 @@ The URL is the central entity. Search results, sitemaps, archive captures and li
 Requires Python 3.12+ and a SearXNG instance with JSON output enabled.
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Toligrim/deepscout.git
 cd deepscout
 python3 -m venv .venv
 source .venv/bin/activate
