@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111318">
+  <title>DeepScout</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">◆</span> DeepScout <span class="badge">MVP</span></div>
+    <div class="project-box">
+      <select id="projectSelect" aria-label="Проект"></select>
+      <button id="newProjectBtn" class="ghost">+ проект</button>
+    </div>
+  </header>
+
+  <main>
+    <nav class="tabs" aria-label="Разделы">
+      <button class="tab active" data-tab="search">Поиск</button>
+      <button class="tab" data-tab="domain">Домен</button>
+      <button class="tab" data-tab="library">База</button>
+    </nav>
+
+    <section id="search" class="panel active">
+      <form id="searchForm" class="search-form">
+        <input id="query" type="search" placeholder="Что ищем? Можно использовать site:, filetype:, кавычки…" autocomplete="off" required>
+        <button type="submit" class="primary">Найти</button>
+      </form>
+      <div class="filters-row">
+        <select id="language"><option value="all">Все языки</option><option value="ru">Русский</option><option value="en">English</option></select>
+        <select id="timeRange"><option value="">Любое время</option><option value="day">День</option><option value="week">Неделя</option><option value="month">Месяц</option><option value="year">Год</option></select>
+      </div>
+      <div id="searchStatus" class="status"></div>
+      <div id="searchResults" class="cards"></div>
+    </section>
+
+    <section id="domain" class="panel">
+      <div class="section-head">
+        <div>
+          <h1>Domain Explorer</h1>
+          <p>Собери известные URL домена из независимых источников.</p>
+        </div>
+      </div>
+      <form id="domainForm" class="domain-form">
+        <input id="domainInput" placeholder="example.com" required>
+        <div class="source-grid">
+          <label><input type="checkbox" name="source" value="sitemap" checked> Sitemap</label>
+          <label><input type="checkbox" name="source" value="wayback" checked> Wayback</label>
+          <label><input type="checkbox" name="source" value="commoncrawl" checked> Common Crawl</label>
+          <label><input type="checkbox" name="source" value="crawl"> Live crawl</label>
+        </div>
+        <div class="filters-row">
+          <label class="inline">Лимит/источник <input id="discoverLimit" type="number" value="1000" min="1" max="10000"></label>
+          <label class="inline"><input id="subdomains" type="checkbox" checked> поддомены</label>
+          <label class="inline">crawl depth <select id="crawlDepth"><option>0</option><option selected>1</option><option>2</option><option>3</option></select></label>
+        </div>
+        <button type="submit" class="primary">Исследовать домен</button>
+      </form>
+      <div id="domainStatus" class="status"></div>
+      <div id="domainSummary" class="summary-grid"></div>
+      <div class="table-toolbar">
+        <input id="domainFilter" placeholder="Фильтр URL…">
+        <select id="kindFilter"><option value="">Все типы</option><option value="page">HTML</option><option value="pdf">PDF</option><option value="document">Документы</option><option value="archive">Архивы</option></select>
+        <select id="sourceFilter"><option value="">Все источники</option><option value="sitemap">Sitemap</option><option value="wayback">Wayback</option><option value="commoncrawl">Common Crawl</option><option value="crawl">Live crawl</option><option value="link">Links</option></select>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr><th>URL</th><th>Тип</th><th>Источники</th><th></th></tr></thead><tbody id="domainRows"></tbody></table>
+      </div>
+    </section>
+
+    <section id="library" class="panel">
+      <div class="section-head"><div><h1>Локальная база</h1><p>Ищи по уже скачанному содержимому через SQLite FTS5.</p></div></div>
+      <form id="localSearchForm" class="search-form">
+        <input id="localQuery" placeholder="например: &quot;BGP communities&quot;" required>
+        <button class="primary">Искать в базе</button>
+      </form>
+      <div id="stats" class="summary-grid"></div>
+      <div id="localResults" class="cards"></div>
+    </section>
+  </main>
+
+  <dialog id="pageDialog">
+    <form method="dialog" class="dialog-head"><strong id="dialogTitle">Страница</strong><button class="ghost">Закрыть</button></form>
+    <div id="dialogMeta" class="muted"></div>
+    <pre id="dialogText"></pre>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
