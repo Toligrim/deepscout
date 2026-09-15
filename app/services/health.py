@@ -33,7 +33,12 @@ async def _discovery_ping(name: str, url: str) -> dict:
             "latency_ms": round((time.monotonic() - started) * 1000, 1),
             "last_error": None if resp.status_code < 500 else f"HTTP {resp.status_code}",
         }
-    except httpx.HTTPError as exc:
+    except Exception as exc:
+        # Broad on purpose: transport-level failures against a flaky third-party host
+        # (TLS resets, DNS hiccups, etc.) don't all surface as httpx.HTTPError — e.g. a
+        # bare ssl.SSLError from a bad TLS record was observed in production against
+        # web.archive.org. One discovery source acting up must never crash the whole
+        # health endpoint, same as every other provider in this codebase is isolated.
         return {"reachable": False, "latency_ms": None, "last_error": str(exc)}
 
 
