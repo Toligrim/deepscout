@@ -266,7 +266,34 @@ def test_openserp_search_degraded_status_with_warnings():
     assert sorted(response.warnings) == ["ecosia: blocked", "google: CAPTCHA", "yandex: CAPTCHA"]
 
 
-def test_openserp_search_all_engines_failed_is_failed_status():
+def test_openserp_search_all_engines_failed_http_200_is_failed_status():
+    # OpenSERP can return HTTP 200 with zero usable results, an empty engines_responded,
+    # and a non-empty engine_errors — every engine failed, but the request itself didn't
+    # error. That must be "failed", not "degraded" (degraded implies some real results).
+    payload = {
+        "query": {"text": "raspberry pi gpio", "engines_requested": ["google", "yandex", "ecosia"]},
+        "meta": {
+            "engines_responded": [],
+            "engines_failed": ["ecosia", "google", "yandex"],
+            "engine_errors": [
+                {"engine": "ecosia", "error": "blocked", "message": "blocked"},
+                {"engine": "google", "error": "captcha_detected", "message": "captcha detected"},
+                {"engine": "yandex", "error": "captcha_detected", "message": "captcha detected"},
+            ],
+        },
+        "results": [],
+        "clusters": [],
+    }
+    mock_get = AsyncMock(return_value=resp(200, payload))
+    with patch("httpx.AsyncClient.get", mock_get):
+        response = run(OpenSerpProvider().search("raspberry pi gpio"))
+    assert response.status == "failed"
+    assert response.results == []
+    assert response.error
+    assert sorted(response.warnings) == ["ecosia: blocked", "google: CAPTCHA", "yandex: CAPTCHA"]
+
+
+def test_openserp_search_http_502_error_is_failed_status():
     error_body = {
         "error": "all_engines_failed",
         "code": 502,

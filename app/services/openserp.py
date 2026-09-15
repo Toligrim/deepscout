@@ -133,13 +133,24 @@ class OpenSerpProvider:
                 )
             )
 
-        warnings = [
-            f"{err.get('engine')}: {_label(err.get('error', ''))}"
-            for err in (payload.get("meta") or {}).get("engine_errors", [])
-        ]
-        status = "degraded" if warnings else "ok"
+        meta = payload.get("meta") or {}
+        engines_responded = meta.get("engines_responded") or []
+        engine_errors = meta.get("engine_errors") or []
+        warnings = [f"{err.get('engine')}: {_label(err.get('error', ''))}" for err in engine_errors]
+
+        if not results and not engines_responded and engine_errors:
+            # HTTP 200 but nothing usable came back and OpenSERP itself confirms no
+            # engine responded — a real failure, not a "degraded" partial success.
+            status = "failed"
+            error = "; ".join(warnings)
+        elif warnings:
+            status = "degraded"
+            error = None
+        else:
+            status = "ok"
+            error = None
         return SearchResponse(
-            backend=self.name, status=status, results=results, latency_ms=latency_ms, warnings=warnings
+            backend=self.name, status=status, results=results, error=error, latency_ms=latency_ms, warnings=warnings
         )
 
     async def health(self) -> BackendHealth:
