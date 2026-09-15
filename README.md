@@ -6,7 +6,10 @@ The goal is not to replace a search engine. The goal is to make poorly indexed p
 
 ## MVP features
 
-- Search through your own SearXNG instance and save every result into a project.
+- Multi-backend search — SearXNG and [OpenSERP](https://github.com/karust/openserp) run in
+  parallel, are deduplicated and ranked deterministically, and every result keeps full
+  backend/engine provenance. One backend failing (or an engine hitting CAPTCHA/429) never fails
+  the whole request — see [Search backends](#search-backends) below.
 - Domain Explorer with independent discovery providers:
   - sitemap.xml and sitemap indexes;
   - robots.txt Sitemap declarations;
@@ -51,6 +54,15 @@ SEARXNG_URL=http://127.0.0.1:8888
 
 SearXNG must allow `format=json` in its `search.formats` configuration.
 
+Optionally run [OpenSERP](https://github.com/karust/openserp) as a second, independent search
+backend and point DeepScout at it:
+
+```bash
+OPENSERP_URL=http://127.0.0.1:7000
+```
+
+DeepScout works fine with only one of the two backends configured/healthy — see below.
+
 ## Docker
 
 ```bash
@@ -72,6 +84,54 @@ Use normal queries and search-engine operators such as:
 
 Each result is automatically stored in the selected project.
 
+### Search backends
+
+DeepScout answers a normal Search query from two independent backends, run in parallel:
+
+- **SearXNG** — whichever engines are enabled on your SearXNG instance.
+- **OpenSERP** — a self-hosted browser-based SERP tool that can reach Google, Bing, Yandex,
+  DuckDuckGo, Ecosia (Baidu is opt-in, off by default).
+
+By default DeepScout queries every configured backend directly, in parallel, on every request —
+there's no health precheck first (that would just add a round-trip; a failing/degraded backend is
+already isolated from the others once the real request is in flight). The UI lets you restrict a
+search to just one backend, and pick which OpenSERP engines to query. Results are deduplicated by
+canonical URL (the same normalization already used everywhere else in DeepScout — tracking
+params stripped, trailing slash/host case normalized) and merged: a URL found through both
+backends keeps a card for *all* of its sources (backend + engine), never duplicate cards. OpenSERP
+itself already clusters a URL across its own engines (`/mega/search` with `dedupe=false&merge=true`,
+parsed via its `clusters` field) — DeepScout only needs to merge SearXNG's results into that.
+
+Each backend's per-request status is one of:
+
+- `ok` — no known engine failures.
+- `degraded` — usable results came back, but at least one engine hit a CAPTCHA/403/429/timeout.
+- `failed` — the backend gave no usable result at all (network/HTTP error, or every engine failed).
+
+`language`/`page`/`time_range` are translated into OpenSERP's real query parameters (`lang`,
+`start`+`limit`, and `date=YYYYMMDD..YYYYMMDD` respectively — confirmed against its OpenAPI spec),
+not just passed through SearXNG's own parameter names.
+
+Ranking is a small, deterministic, unit-tested formula (`app/services/aggregation.py`):
+
+```
+score = 1 / best_rank_across_contributors
+      + 0.3 * (distinct_engine_count - 1)
+      + 0.5 * (found in more than one backend)
+      + 0.1 * SearXNG's own relevance score, if present
+```
+
+**DeepScout never tries to solve CAPTCHAs, rotate proxies, or otherwise evade a search engine's
+anti-bot protection.** When an engine returns a CAPTCHA/403/429/timeout, DeepScout reports it as
+`degraded` and keeps working with whatever else responded — it does not retry harder or spoof a
+different fingerprint to get around the block.
+
+`GET /api/search/health` (cached in memory for `DEEPSCOUT_HEALTH_CACHE_SECONDS`, default 30s)
+reports, per backend and per engine, one of `ok` / `degraded` / `failed` / `unknown` plus a short
+reason (`CAPTCHA`, `blocked`, `rate_limited`, `timeout`, …) — never a raw stack trace. Wayback and
+Common Crawl reachability are reported separately, under `discovery`, since they aren't SERP
+engines.
+
 ### Domain Explorer
 
 Enter a domain and select discovery providers. DeepScout runs them independently; one provider can fail without aborting the others. Results can be filtered by substring, source, and document type.
@@ -90,6 +150,7 @@ The `База` tab searches only content that you explicitly fetched. This is us
 - `GET /api/projects`
 - `POST /api/projects`
 - `POST /api/search`
+- `GET /api/search/health`
 - `POST /api/discover/domain`
 - `POST /api/fetch`
 - `GET /api/urls`
@@ -108,8 +169,11 @@ DeepScout is intended for research, not aggressive crawling. Live crawl obeys ro
 - Wayback queries use a single bounded request; very large domains will later need resume-key pagination.
 - Common Crawl uses the latest collection only.
 - JS-only pages are not rendered yet; a Playwright fallback is planned.
-- Search currently uses SearXNG only; OpenSERP can be added as a second provider.
 - PDF text extraction and WARC body retrieval are not in the MVP yet.
+- OpenSERP's own multi-engine query (`/mega/search`) can take 15-20s end to end when several
+  engines are slow/CAPTCHA'd, since DeepScout only reports what actually happened — it doesn't
+  cut a slow engine short. With both backends enabled by default, a normal Search can occasionally
+  take noticeably longer than SearXNG alone did in v0.1.
 
 ## Roadmap
 

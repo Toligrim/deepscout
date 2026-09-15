@@ -24,6 +24,10 @@
     </nav>
 
     <section id="search" class="panel active">
+      <details id="sourcesPanel" class="sources-panel">
+        <summary>Источники поиска <span id="sourcesSummary" class="muted"></span></summary>
+        <div id="sourcesBody" class="sources-body">Загрузка…</div>
+      </details>
       <form id="searchForm" class="search-form">
         <input id="query" type="search" placeholder="Что ищем? Можно использовать site:, filetype:, кавычки…" autocomplete="off" required>
         <button type="submit" class="primary">Найти</button>
@@ -31,6 +35,20 @@
       <div class="filters-row">
         <select id="language"><option value="all">Все языки</option><option value="ru">Русский</option><option value="en">English</option></select>
         <select id="timeRange"><option value="">Любое время</option><option value="day">День</option><option value="week">Неделя</option><option value="month">Месяц</option><option value="year">Год</option></select>
+      </div>
+      <div class="filters-row">
+        <label class="inline"><input type="checkbox" id="backendSearxng" checked> SearXNG</label>
+        <label class="inline"><input type="checkbox" id="backendOpenserp" checked> OpenSERP</label>
+        <details class="engine-picker">
+          <summary class="muted">OpenSERP engines</summary>
+          <div class="source-grid">
+            <label><input type="checkbox" name="openserpEngine" value="google" checked> Google</label>
+            <label><input type="checkbox" name="openserpEngine" value="bing" checked> Bing</label>
+            <label><input type="checkbox" name="openserpEngine" value="yandex" checked> Yandex</label>
+            <label><input type="checkbox" name="openserpEngine" value="duckduckgo" checked> DuckDuckGo</label>
+            <label><input type="checkbox" name="openserpEngine" value="ecosia" checked> Ecosia</label>
+          </div>
+        </details>
       </div>
       <div id="searchStatus" class="status"></div>
       <div id="searchResults" class="cards"></div>
