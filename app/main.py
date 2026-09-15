@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import db as store
 from .config import settings
+from .services.aggregation import run_search
 from .services.discovery import (
     discover_commoncrawl,
     discover_live_crawl,
@@ -18,7 +19,7 @@ from .services.discovery import (
     discover_wayback,
 )
 from .services.fetcher import fetch_page
-from .services.search import search_searxng
+from .services.health import get_search_health
 from .utils import normalize_domain
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,6 +39,8 @@ class SearchRequest(BaseModel):
     page: int = 1
     language: str = "all"
     time_range: str | None = None
+    backends: list[str] | None = None
+    openserp_engines: list[str] | None = None
 
 
 class DiscoverRequest(BaseModel):
@@ -86,30 +89,65 @@ def create_project(payload: ProjectCreate):
 
 @app.post("/api/search")
 async def web_search(payload: SearchRequest):
-    try:
-        results = await search_searxng(
-            payload.query,
-            page=payload.page,
-            language=payload.language,
-            time_range=payload.time_range,
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"SearXNG request failed: {exc}") from exc
+    backends = payload.backends
+    if not backends:
+        health_state = await get_search_health()
+        healthy = [b for b in ("searxng", "openserp") if health_state.get(b, {}).get("reachable")]
+        backends = healthy or None  # fall back to "try everything" if health itself is unknown
+
+    aggregated = await run_search(
+        payload.query,
+        backends=backends,
+        openserp_engines=payload.openserp_engines,
+        page=payload.page,
+        language=payload.language,
+        time_range=payload.time_range,
+    )
+
     stored = []
-    for item in results:
-        detail = ",".join(item.get("engines") or []) or None
+    for m in aggregated.results:
+        primary_backend, primary_engine = m.contributions[0] if m.contributions else (m.backends[0], None)
         row = store.upsert_url(
             payload.project_id,
-            item["url"],
-            source="searxng",
-            source_detail=detail,
-            title=item.get("title"),
-            snippet=item.get("snippet"),
+            m.canonical_url,
+            source=primary_backend,
+            source_detail=primary_engine,
+            title=m.title,
+            snippet=m.snippet,
         )
-        if row:
-            stored.append({**item, "canonical_url": row["url"]})
-    store.record_query(payload.project_id, payload.query, "searxng", len(stored))
-    return {"query": payload.query, "count": len(stored), "results": stored}
+        if not row:
+            continue
+        for backend, engine in m.contributions[1:]:
+            store.add_url_source(payload.project_id, row["id"], backend, engine)
+        stored.append(
+            {
+                "url": m.canonical_url,
+                "canonical_url": row["url"],
+                "title": m.title,
+                "snippet": m.snippet,
+                "backends": m.backends,
+                "engines": m.engines,
+                "rank": m.best_rank,
+                "score": round(m.score, 4),
+                "publishedDate": m.published_at,
+            }
+        )
+
+    for backend in aggregated.backends:
+        store.record_query(payload.project_id, payload.query, backend, aggregated.backends[backend]["count"])
+
+    return {
+        "query": payload.query,
+        "count": len(stored),
+        "results": stored,
+        "backends": aggregated.backends,
+        "warnings": aggregated.warnings,
+    }
+
+
+@app.get("/api/search/health")
+async def search_health(refresh: bool = False):
+    return await get_search_health(force=refresh)
 
 
 @app.post("/api/discover/domain")

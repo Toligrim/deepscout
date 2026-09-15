@@ -212,6 +212,19 @@ def upsert_url(
         return dict(row)
 
 
+def add_url_source(project_id: int, url_id: int, source: str, source_detail: str | None) -> None:
+    """Record one extra provenance row for a URL that was already stored via upsert_url.
+
+    Used to attach every contributing (backend, engine) pair to a merged search result
+    without re-running the full upsert (title/snippet/kind logic already ran once).
+    """
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO url_sources(project_id, url_id, source, source_detail, discovered_at) VALUES (?,?,?,?,?)",
+            (project_id, url_id, source, source_detail, utcnow()),
+        )
+
+
 def add_capture(
     url_id: int,
     source: str,

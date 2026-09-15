@@ -36,22 +36,42 @@ $$('.tab').forEach(btn => btn.addEventListener('click', async () => {
   if(btn.dataset.tab === 'library') await refreshStats();
 }));
 
+function selectedBackends() {
+  const backends = [];
+  if ($('#backendSearxng').checked) backends.push('searxng');
+  if ($('#backendOpenserp').checked) backends.push('openserp');
+  return backends.length ? backends : null;
+}
+function selectedOpenserpEngines() {
+  const engines = $$('input[name=openserpEngine]:checked').map(x => x.value);
+  return engines.length ? engines : null;
+}
+
 $('#searchForm').addEventListener('submit', async e => {
   e.preventDefault(); const q = $('#query').value.trim(); if(!q) return;
-  status($('#searchStatus'), 'Ищу через SearXNG…'); $('#searchResults').innerHTML='';
+  status($('#searchStatus'), 'Ищу…'); $('#searchResults').innerHTML='';
   try {
-    const data = await api('/api/search', {method:'POST', body:JSON.stringify({project_id:projectId, query:q, language:$('#language').value, time_range:$('#timeRange').value || null})});
-    status($('#searchStatus'), `Найдено и сохранено: ${data.count}`, 'good');
-    $('#searchResults').innerHTML = data.results.map(renderSearchCard).join('');
+    const data = await api('/api/search', {method:'POST', body:JSON.stringify({
+      project_id:projectId, query:q, language:$('#language').value, time_range:$('#timeRange').value || null,
+      backends:selectedBackends(), openserp_engines:selectedOpenserpEngines(),
+    })});
+    const backendLine = Object.entries(data.backends||{}).map(([name,v]) => `${esc(name)}: ${v.status==='ok'?v.count:'ошибка'}`).join(' · ');
+    status($('#searchStatus'), `Найдено и сохранено: ${data.count}. ${backendLine}`, data.warnings && data.warnings.length ? '' : 'good');
+    $('#searchResults').innerHTML = data.results.map(renderSearchCard).join('') || '<div class="muted">Ничего не найдено.</div>';
+    if (data.warnings && data.warnings.length) {
+      $('#searchResults').insertAdjacentHTML('beforebegin', `<div class="warn-line">${data.warnings.map(esc).join(' · ')}</div>`);
+    }
   } catch(err) { status($('#searchStatus'), err.message, 'error'); }
 });
 
 function renderSearchCard(r) {
   const domain = (()=>{try{return new URL(r.canonical_url || r.url).hostname}catch{return ''}})();
+  const provenance = (r.backends||[]).map(b=>`<span class="chip">${esc(b)}</span>`).join('') + (r.engines||[]).map(e=>`<span class="chip">${esc(e)}</span>`).join('');
   return `<article class="card">
     <div class="card-title"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a></div>
     <div class="url">${esc(r.canonical_url || r.url)}</div>
     <div class="snippet">${esc(r.snippet || '')}</div>
+    <div class="engine-row">${provenance}</div>
     <div class="card-actions">
       <button class="mini action-domain" data-domain="${esc(domain)}">Исследовать домен</button>
       <button class="mini action-fetch" data-url="${esc(r.canonical_url || r.url)}">Текст + ссылки</button>
@@ -59,6 +79,39 @@ function renderSearchCard(r) {
     </div>
   </article>`;
 }
+
+const STATUS_DOT = {ok:'dot-ok', degraded:'dot-degraded', failed:'dot-failed', unknown:'dot-unknown'};
+function backendStatus(b) {
+  if (!b.reachable) return 'failed';
+  const bad = (b.engines||[]).filter(e => e.status === 'degraded' || e.status === 'failed').length;
+  if (bad && bad === (b.engines||[]).length) return 'failed';
+  if (bad) return 'degraded';
+  return 'ok';
+}
+function renderBackendBlock(name, label, b) {
+  const st = backendStatus(b);
+  const engines = (b.engines||[]).map(e => `<span class="engine-chip" title="${esc(e.reason||'')}"><span class="dot ${STATUS_DOT[e.status]||'dot-unknown'}"></span>${esc(e.name)}</span>`).join('');
+  const err = b.last_error ? ` · ${esc(b.last_error)}` : '';
+  return `<div class="source-block">
+    <div class="source-block-head"><span class="dot ${STATUS_DOT[st]}"></span>${esc(label)}${b.latency_ms!=null?` · ${Math.round(b.latency_ms)} мс`:''}${err}</div>
+    <div class="engine-row">${engines}</div>
+  </div>`;
+}
+async function loadSourcesHealth() {
+  try {
+    const h = await api('/api/search/health');
+    const overall = ['searxng','openserp'].map(n => backendStatus(h[n]||{reachable:false,engines:[]}));
+    const worst = overall.includes('failed') ? 'дегрдация' : overall.includes('degraded') ? 'частично' : 'ok';
+    $('#sourcesSummary').textContent = `(${worst})`;
+    const discovery = h.discovery || {};
+    const discoveryBlock = `<div class="source-block"><div class="source-block-head">Discovery</div><div class="engine-row">
+      <span class="engine-chip"><span class="dot ${discovery.wayback?.reachable?'dot-ok':'dot-failed'}"></span>Wayback</span>
+      <span class="engine-chip"><span class="dot ${discovery.commoncrawl?.reachable?'dot-ok':'dot-failed'}"></span>Common Crawl</span>
+    </div></div>`;
+    $('#sourcesBody').innerHTML = renderBackendBlock('searxng','SearXNG', h.searxng||{engines:[]}) + renderBackendBlock('openserp','OpenSERP', h.openserp||{engines:[]}) + discoveryBlock;
+  } catch(err) { $('#sourcesBody').innerHTML = `<div class="status error">${esc(err.message)}</div>`; }
+}
+loadSourcesHealth();
 
 function quoteSearch(text) { $$('.tab')[0].click(); $('#query').value = `"${text.replaceAll('"','')}"`; $('#query').focus(); }
 function deepDomain(domain) { $$('.tab')[1].click(); $('#domainInput').value = domain; currentDomain = domain; $('#domainInput').focus(); }
