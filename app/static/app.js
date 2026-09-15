@@ -55,7 +55,7 @@ $('#searchForm').addEventListener('submit', async e => {
       project_id:projectId, query:q, language:$('#language').value, time_range:$('#timeRange').value || null,
       backends:selectedBackends(), openserp_engines:selectedOpenserpEngines(),
     })});
-    const backendLine = Object.entries(data.backends||{}).map(([name,v]) => `${esc(name)}: ${v.status==='ok'?v.count:'ошибка'}`).join(' · ');
+    const backendLine = Object.entries(data.backends||{}).map(([name,v]) => `${esc(name)}: ${v.status==='failed'?'ошибка':v.count}`).join(' · ');
     status($('#searchStatus'), `Найдено и сохранено: ${data.count}. ${backendLine}`, data.warnings && data.warnings.length ? '' : 'good');
     $('#searchResults').innerHTML = data.results.map(renderSearchCard).join('') || '<div class="muted">Ничего не найдено.</div>';
     if (data.warnings && data.warnings.length) {

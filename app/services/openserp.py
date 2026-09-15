@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import date, timedelta
 
 import httpx
 
@@ -13,22 +14,48 @@ from .providers import BackendHealth, EngineHealth, SearchResponse, SearchResult
 DEFAULT_ENGINES = ["google", "bing", "yandex", "duckduckgo", "ecosia"]
 ALL_ENGINES = ["google", "bing", "yandex", "duckduckgo", "ecosia", "baidu"]
 
-# OpenSERP v0.8.12 error codes (see /mega/search meta.engine_errors[].error), mapped to
-# DeepScout's own short health-reason vocabulary.
+# Result page size for /mega/search (its own default is 10; DeepScout asks for a page size
+# closer to what SearXNG typically returns per page).
+DEFAULT_LIMIT = 20
+
+# SearXNG-style time_range -> how many days back from today, for OpenSERP's `date`
+# param (YYYYMMDD..YYYYMMDD, confirmed against the live openapi.yaml).
+_TIME_RANGE_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
+
+# OpenSERP v0.8.12 error codes (see /mega/search meta.engine_errors[].error and the
+# ErrorResponse.error enum in its OpenAPI spec), mapped to DeepScout's own short
+# health-reason vocabulary.
 _ERROR_LABELS = {
     "captcha_detected": "CAPTCHA",
     "blocked": "blocked",
     "rate_limited": "rate_limited",
     "proxy_timeout": "timeout",
     "timeout": "timeout",
+    "search_timeout": "timeout",
+    "request_timeout": "timeout",
     "empty_result": "empty_result",
     "engine_internal": "error",
+    "parser_failure": "error",
+    "request_canceled": "error",
+    "proxy_connect": "error",
+    "proxy_auth": "error",
+    "proxy_unavailable": "unavailable",
     "circuit_open": "unavailable",
+    "all_engines_failed": "unavailable",
 }
 
 
 def _label(error_code: str) -> str:
     return _ERROR_LABELS.get(error_code, error_code[:40] or "error")
+
+
+def _date_param(time_range: str | None, *, today: date | None = None) -> str | None:
+    days = _TIME_RANGE_DAYS.get(time_range or "")
+    if not days:
+        return None
+    end = today or date.today()
+    start = end - timedelta(days=days)
+    return f"{start:%Y%m%d}..{end:%Y%m%d}"
 
 
 class OpenSerpProvider:
@@ -44,7 +71,22 @@ class OpenSerpProvider:
         engines: list[str] | None = None,
     ) -> SearchResponse:
         engines = engines or DEFAULT_ENGINES
-        params = {"text": query, "engines": ",".join(engines)}
+        params: dict[str, str | int] = {
+            "text": query,
+            "engines": ",".join(engines),
+            "limit": DEFAULT_LIMIT,
+            "start": max(page - 1, 0) * DEFAULT_LIMIT,
+            # dedupe=false so every engine's own copy of a shared URL stays in the flat
+            # `results` list (needed below to resolve snippet/title for every occurrence
+            # in a cluster) — merge=true so all engines' hits are actually present.
+            "dedupe": "false",
+            "merge": "true",
+        }
+        if language and language not in {"all", "any"}:
+            params["lang"] = language
+        date_param = _date_param(time_range)
+        if date_param:
+            params["date"] = date_param
 
         started = time.monotonic()
         try:
@@ -53,28 +95,41 @@ class OpenSerpProvider:
                 headers={"User-Agent": settings.user_agent},
             ) as client:
                 response = await client.get(f"{settings.openserp_url}/mega/search", params=params)
-                response.raise_for_status()
                 payload = response.json()
+                if response.status_code >= 400:
+                    detail = payload.get("message") or payload.get("error") or f"HTTP {response.status_code}"
+                    return SearchResponse(backend=self.name, status="failed", results=[], error=detail)
         except httpx.HTTPError as exc:
             return SearchResponse(backend=self.name, status="failed", results=[], error=str(exc))
+        except ValueError as exc:  # malformed JSON body
+            return SearchResponse(backend=self.name, status="failed", results=[], error=f"invalid response: {exc}")
         latency_ms = (time.monotonic() - started) * 1000
 
+        # `clusters` (always present on /mega/search, independent of the `dedupe` flag)
+        # is the source of truth for cross-engine provenance: the flat `results` list
+        # only ever attributes a URL to whichever single engine's copy survived, which
+        # loses exactly the multi-engine information DeepScout needs.
+        results_by_id = {item.get("id"): item for item in payload.get("results", []) if item.get("id")}
         results: list[SearchResult] = []
-        for item in payload.get("results", []):
-            if item.get("type") == "ad":
+        for cluster in payload.get("clusters") or []:
+            url = cluster.get("canonical_url")
+            occurrences = cluster.get("occurrences") or []
+            if not url or not occurrences:
                 continue
-            url = item.get("url")
-            if not url:
+            best = min(occurrences, key=lambda o: o.get("rank", 999))
+            best_item = results_by_id.get(best.get("result_id")) or {}
+            if best_item.get("type") == "ad":
                 continue
+            engine_names = [o["engine"] for o in occurrences if o.get("engine")]
             results.append(
                 SearchResult(
                     url=url,
-                    title=item.get("title"),
-                    snippet=item.get("snippet"),
+                    title=cluster.get("title") or best_item.get("title"),
+                    snippet=best_item.get("snippet"),
                     backend=self.name,
-                    engines=[item["engine"]] if item.get("engine") else [],
-                    rank=item.get("rank") or (item.get("position") or {}).get("absolute") or 999,
-                    metadata={"domain": item.get("domain")},
+                    engines=engine_names,
+                    rank=cluster.get("best_rank") or best.get("rank") or 999,
+                    metadata={"domain": cluster.get("domain"), "cluster_score": cluster.get("score")},
                 )
             )
 
@@ -82,8 +137,9 @@ class OpenSerpProvider:
             f"{err.get('engine')}: {_label(err.get('error', ''))}"
             for err in (payload.get("meta") or {}).get("engine_errors", [])
         ]
+        status = "degraded" if warnings else "ok"
         return SearchResponse(
-            backend=self.name, status="ok", results=results, latency_ms=latency_ms, warnings=warnings
+            backend=self.name, status=status, results=results, latency_ms=latency_ms, warnings=warnings
         )
 
     async def health(self) -> BackendHealth:

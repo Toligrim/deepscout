@@ -1,6 +1,9 @@
+from unittest.mock import AsyncMock
+
 from app import main as app_main
+from app.services import aggregation
 from app.services.aggregation import AggregatedSearchResponse, MergedResult
-from app.services.providers import BackendHealth
+from app.services.providers import SearchResponse
 
 
 def _agg(results=None, backends=None, warnings=None):
@@ -31,11 +34,6 @@ def test_search_old_request_shape_still_works(client, monkeypatch):
         )
 
     monkeypatch.setattr(app_main, "run_search", fake_run_search)
-    monkeypatch.setattr(
-        app_main,
-        "get_search_health",
-        lambda **k: _await({"searxng": {"reachable": True}, "openserp": {"reachable": True}}),
-    )
 
     resp = client.post("/api/search", json={"project_id": 1, "query": "raspberry pi"})
     assert resp.status_code == 200
@@ -60,7 +58,6 @@ def test_search_partial_backend_failure_returns_200(client, monkeypatch):
         )
 
     monkeypatch.setattr(app_main, "run_search", fake_run_search)
-    monkeypatch.setattr(app_main, "get_search_health", lambda **k: _await({}))
 
     resp = client.post("/api/search", json={"project_id": 1, "query": "q", "backends": ["searxng", "openserp"]})
     assert resp.status_code == 200
@@ -88,7 +85,6 @@ def test_search_stores_provenance_for_every_contribution(client, monkeypatch):
         )
 
     monkeypatch.setattr(app_main, "run_search", fake_run_search)
-    monkeypatch.setattr(app_main, "get_search_health", lambda **k: _await({}))
 
     resp = client.post("/api/search", json={"project_id": 1, "query": "q", "backends": ["searxng", "openserp"]})
     assert resp.status_code == 200
@@ -130,5 +126,23 @@ def test_domain_explorer_unaffected_by_search_changes(client, monkeypatch):
     assert data["processed"] == 1
 
 
-async def _await(value):
-    return value
+def test_search_never_calls_health_or_extra_probe_requests(client, monkeypatch):
+    """The default (no explicit backends) Search request must go straight to both
+    providers' search() in parallel — no health() precheck, no probe search first."""
+    searxng_health = AsyncMock()
+    openserp_health = AsyncMock()
+    searxng_search = AsyncMock(return_value=SearchResponse(backend="searxng", status="ok", results=[]))
+    openserp_search = AsyncMock(return_value=SearchResponse(backend="openserp", status="ok", results=[]))
+
+    monkeypatch.setattr(aggregation.PROVIDERS["searxng"], "health", searxng_health)
+    monkeypatch.setattr(aggregation.PROVIDERS["openserp"], "health", openserp_health)
+    monkeypatch.setattr(aggregation.PROVIDERS["searxng"], "search", searxng_search)
+    monkeypatch.setattr(aggregation.PROVIDERS["openserp"], "search", openserp_search)
+
+    resp = client.post("/api/search", json={"project_id": 1, "query": "q"})
+    assert resp.status_code == 200
+
+    searxng_health.assert_not_awaited()
+    openserp_health.assert_not_awaited()
+    searxng_search.assert_awaited_once()
+    openserp_search.assert_awaited_once()

@@ -92,11 +92,25 @@ DeepScout answers a normal Search query from two independent backends, run in pa
 - **OpenSERP** — a self-hosted browser-based SERP tool that can reach Google, Bing, Yandex,
   DuckDuckGo, Ecosia (Baidu is opt-in, off by default).
 
-By default DeepScout uses every backend that is currently healthy; the UI lets you restrict a
-search to just one, and pick which OpenSERP engines to query. Results are deduplicated by
+By default DeepScout queries every configured backend directly, in parallel, on every request —
+there's no health precheck first (that would just add a round-trip; a failing/degraded backend is
+already isolated from the others once the real request is in flight). The UI lets you restrict a
+search to just one backend, and pick which OpenSERP engines to query. Results are deduplicated by
 canonical URL (the same normalization already used everywhere else in DeepScout — tracking
 params stripped, trailing slash/host case normalized) and merged: a URL found through both
-backends keeps a card for *all* of its sources (backend + engine), never duplicate cards.
+backends keeps a card for *all* of its sources (backend + engine), never duplicate cards. OpenSERP
+itself already clusters a URL across its own engines (`/mega/search` with `dedupe=false&merge=true`,
+parsed via its `clusters` field) — DeepScout only needs to merge SearXNG's results into that.
+
+Each backend's per-request status is one of:
+
+- `ok` — no known engine failures.
+- `degraded` — usable results came back, but at least one engine hit a CAPTCHA/403/429/timeout.
+- `failed` — the backend gave no usable result at all (network/HTTP error, or every engine failed).
+
+`language`/`page`/`time_range` are translated into OpenSERP's real query parameters (`lang`,
+`start`+`limit`, and `date=YYYYMMDD..YYYYMMDD` respectively — confirmed against its OpenAPI spec),
+not just passed through SearXNG's own parameter names.
 
 Ranking is a small, deterministic, unit-tested formula (`app/services/aggregation.py`):
 

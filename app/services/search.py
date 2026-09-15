@@ -92,7 +92,16 @@ class SearxngProvider:
                     metadata={"positions": item.get("positions")},
                 )
             )
-        return SearchResponse(backend=self.name, status="ok", results=results, latency_ms=latency_ms)
+
+        # unresponsive_engines is present on every /search response, not just the
+        # dedicated health probe — surface it here too instead of only in health().
+        warnings = [
+            f"{name}: {_classify_reason(reason)}" for name, reason in payload.get("unresponsive_engines", [])
+        ]
+        status = "degraded" if warnings else "ok"
+        return SearchResponse(
+            backend=self.name, status=status, results=results, latency_ms=latency_ms, warnings=warnings
+        )
 
     async def health(self) -> BackendHealth:
         started = time.monotonic()

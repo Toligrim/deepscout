@@ -89,15 +89,14 @@ def create_project(payload: ProjectCreate):
 
 @app.post("/api/search")
 async def web_search(payload: SearchRequest):
-    backends = payload.backends
-    if not backends:
-        health_state = await get_search_health()
-        healthy = [b for b in ("searxng", "openserp") if health_state.get(b, {}).get("reachable")]
-        backends = healthy or None  # fall back to "try everything" if health itself is unknown
-
+    # No health precheck here on purpose: every configured backend is tried directly,
+    # in parallel, on every request. run_search()/aggregation.py already isolate a
+    # failing backend (or a failing provider.search() call) from the others — a health
+    # probe first would just add latency and an extra round-trip for no benefit. Health
+    # state is only for the UI, via the separate GET /api/search/health.
     aggregated = await run_search(
         payload.query,
-        backends=backends,
+        backends=payload.backends,
         openserp_engines=payload.openserp_engines,
         page=payload.page,
         language=payload.language,
