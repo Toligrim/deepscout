@@ -1,5 +1,7 @@
 import asyncio
 import dataclasses
+import ssl
+from unittest.mock import AsyncMock, patch
 
 from app.config import settings as app_settings
 from app.services import health
@@ -69,3 +71,30 @@ def test_health_provider_bug_does_not_crash_endpoint(monkeypatch):
     assert result["searxng"]["reachable"] is False
     assert "bug" in result["searxng"]["last_error"]
     assert result["openserp"]["reachable"] is True
+
+
+def test_discovery_ping_survives_non_httpx_transport_error():
+    # Regression: a bare ssl.SSLError (observed in production against web.archive.org)
+    # is not a subclass of httpx.HTTPError and previously escaped uncaught, crashing
+    # the whole /api/search/health endpoint via asyncio.gather.
+    mock_get = AsyncMock(side_effect=ssl.SSLError("decryption failed or bad record mac"))
+    with patch("httpx.AsyncClient.get", mock_get):
+        result = run(health._discovery_ping("wayback", "https://web.archive.org/cdx/search/cdx"))
+    assert result["reachable"] is False
+    assert "decryption failed" in result["last_error"]
+
+
+def test_health_endpoint_survives_discovery_transport_error(monkeypatch):
+    health._cache = None
+    health._cache_at = 0.0
+
+    monkeypatch.setattr(health.PROVIDERS["searxng"], "health", lambda: asyncio.sleep(0, result=_ok("searxng")))
+    monkeypatch.setattr(health.PROVIDERS["openserp"], "health", lambda: asyncio.sleep(0, result=_ok("openserp")))
+
+    mock_get = AsyncMock(side_effect=ssl.SSLError("decryption failed or bad record mac"))
+    with patch("httpx.AsyncClient.get", mock_get):
+        result = run(health.get_search_health(force=True))
+
+    assert result["discovery"]["wayback"]["reachable"] is False
+    assert result["discovery"]["commoncrawl"]["reachable"] is False
+    assert result["searxng"]["reachable"] is True
