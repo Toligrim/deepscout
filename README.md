@@ -192,19 +192,30 @@ embeddings, nothing that "decides" beyond the rules documented here.
 5. **Merge** — one row per URL in `job_urls` (relevance score/tier, the score of the domain it
    came from, and its best SERP rank if it had one) linking to the same `urls`/`url_sources` rows
    everything else in DeepScout already uses — no separate URL store. Provenance for *this job* is
-   tracked separately in `job_url_sources` (job_id + url_id + source + source_detail) — distinct
-   from the project-wide, cross-job `url_sources` table. This matters because a URL is a
-   project-wide entity: if an earlier Deep Search found it via Wayback and a later one re-finds
-   the same URL only via OpenSERP/Bing, the later job's results must show only OpenSERP/Bing, not
-   inherit Wayback from a run that has nothing to do with it. `url_sources` still gets the same
-   writes as always (nothing about the project-wide provenance changes) — `job_url_sources` is an
-   additional, job-scoped view on top.
+   tracked separately in `job_url_sources` (job_id + url_id + source + source_detail, every pair
+   kept — nothing is collapsed away) — distinct from the project-wide, cross-job `url_sources`
+   table. This matters because a URL is a project-wide entity: if an earlier Deep Search found it
+   via Wayback and a later one re-finds the same URL only via OpenSERP/Bing, the later job's
+   results must show only OpenSERP/Bing, not inherit Wayback from a run that has nothing to do
+   with it. `url_sources` still gets the same writes as always (nothing about the project-wide
+   provenance changes) — `job_url_sources` is an additional, job-scoped view on top. Each result
+   from `GET /api/deep-search/{id}/results` carries a `provenance` list of every `{source,
+   detail}` pair this job found it through (e.g. `{"source": "openserp", "detail": "bing"}`,
+   `{"source": "wayback", "detail": null}`) — the UI collapses same-source discovery entries
+   (multiple sitemap URLs, multiple Common Crawl collections) into one chip since they aren't
+   independent signals, but shows each search engine (`openserp · bing`, `openserp ·
+   duckduckgo`, `searxng · brave`) separately.
 
 **Sort order** shown to you: tier first (high → possible → discovered), then within a tier — how
-many independent sources *this specific job* found the URL through (desc, computed live from
-`job_url_sources`, not stored redundantly), then its best SERP rank if it had one (asc, URLs with
-no SERP rank at all — pure discovery finds — sort after any real rank), then the lexical relevance
-score (desc), then the URL string as a final deterministic tie-breaker.
+many *independent* sources this specific job found the URL through (desc), then its best SERP
+rank if it had one (asc, URLs with no SERP rank at all — pure discovery finds — sort after any
+real rank), then the lexical relevance score (desc), then the URL string as a final deterministic
+tie-breaker. "Independent" is deliberately not just "distinct (source, detail) pairs": two
+different search engines (`openserp/bing` and `openserp/duckduckgo`) are two real corroborating
+signals and count separately, but two Common Crawl collections or two sitemap URLs for the same
+domain are not — each discovery source (`sitemap`/`wayback`/`commoncrawl`) counts at most once no
+matter how many collections/URLs it produced, so a domain with a huge sitemap doesn't
+artificially outrank one confirmed by two independent search engines.
 
 **Job status**: `failed` only if the whole pipeline produced zero usable results (or an actual
 internal bug aborted it); `partial` if there's at least one usable result but something also

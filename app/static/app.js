@@ -249,8 +249,21 @@ async function loadDsResults(jobId) {
 }
 $('#dsTierFilter').addEventListener('change', () => { const jobId = $('#dsResults').dataset.jobId; if (jobId) loadDsResults(jobId); });
 
+const DS_ENGINE_LEVEL_SOURCES = new Set(['searxng', 'openserp']);
+function provenanceChipLabels(provenance) {
+  // openserp/bing and openserp/duckduckgo are independent search signals worth
+  // showing separately; multiple sitemap URLs or Common Crawl collections for the
+  // same discovery source are not (see _independent_source_count server-side) — so
+  // those collapse into a single "sitemap"/"wayback"/"commoncrawl" chip.
+  const labels = new Set();
+  (provenance || []).forEach(p => {
+    labels.add(DS_ENGINE_LEVEL_SOURCES.has(p.source) && p.detail ? `${p.source} · ${p.detail}` : p.source);
+  });
+  return [...labels];
+}
+
 function renderDsCard(r) {
-  const sources = (r.sources || '').split(',').filter(Boolean);
+  const sources = provenanceChipLabels(r.provenance);
   return `<article class="card">
     <div class="card-title"><span class="tier-chip tier-${esc(r.relevance_tier)}">${esc(r.relevance_tier)}</span><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a></div>
     <div class="url">${esc(r.url)}</div>

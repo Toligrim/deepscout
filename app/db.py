@@ -167,7 +167,7 @@ def init_db() -> None:
                 job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 url_id INTEGER NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
                 source TEXT NOT NULL,
-                source_detail TEXT,
+                source_detail TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(job_id, url_id, source, source_detail)
             );
             CREATE INDEX IF NOT EXISTS idx_job_url_sources_job ON job_url_sources(job_id);
@@ -459,12 +459,33 @@ def add_job_url(
 def add_job_url_source(job_id: int, url_id: int, source: str, source_detail: str | None) -> None:
     """Provenance scoped to this one Deep Search run — see job_url_sources in init_db().
     Callers also write the same fact to the project-wide url_sources (via upsert_url /
-    add_url_source) separately; this is not a replacement for that, just a job-scoped view."""
+    add_url_source) separately; this is not a replacement for that, just a job-scoped view.
+
+    source_detail is normalized to '' rather than left NULL: SQL NULL never equals NULL,
+    so two rows differing only by a NULL detail wouldn't be deduplicated by the
+    PRIMARY KEY the way two rows sharing '' reliably are.
+    """
     with db() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO job_url_sources(job_id, url_id, source, source_detail) VALUES (?,?,?,?)",
-            (job_id, url_id, source, source_detail),
+            (job_id, url_id, source, source_detail or ""),
         )
+
+
+# Sources whose source_detail names an independent search signal (a distinct engine) —
+# each (source, detail) pair counts separately toward a URL's independent-source count.
+# Discovery sources' detail (a sitemap URL, a Common Crawl collection id) is provenance
+# worth keeping, but multiple sitemaps/collections for the same source are not
+# independent corroboration the way two different search engines are — each discovery
+# source counts at most once no matter how many detail values it produced.
+_ENGINE_LEVEL_SOURCES = {"searxng", "openserp"}
+
+
+def _independent_source_count(pairs: Iterable[tuple[str, str]]) -> int:
+    signals: set = set()
+    for source, detail in pairs:
+        signals.add((source, detail) if source in _ENGINE_LEVEL_SOURCES else source)
+    return len(signals)
 
 
 def list_job_urls(
@@ -474,40 +495,64 @@ def list_job_urls(
     limit: int = 500,
     offset: int = 0,
 ) -> list[dict]:
-    """Results for one Deep Search run. Provenance ('sources'/'source_count') comes only
-    from job_url_sources — this job's own findings — never from the project-wide
-    url_sources, so an older job's sources can never leak into a newer job's results for
-    a URL both happened to touch.
+    """Results for one Deep Search run. Provenance comes only from job_url_sources —
+    this job's own findings — never from the project-wide url_sources, so an older
+    job's sources can never leak into a newer job's results for a URL both happened to
+    touch. Each row's 'provenance' is the full list of (source, detail) pairs this job
+    found it through; 'source_count' is how many *independent* signals that is (see
+    _independent_source_count — multiple engines count separately, multiple discovery
+    collections/sitemaps for the same source do not).
 
-    Sort order within a tier: how many independent sources *this job* found the URL
-    through (desc), then its best SERP rank if it had one (asc, NULLs last), then the
-    lexical relevance score (desc), then the URL itself as a final deterministic
-    tie-breaker.
+    Sort order within a tier: source_count (desc), then best SERP rank if it had one
+    (asc, NULLs last), then lexical relevance score (desc), then the URL itself as a
+    final deterministic tie-breaker. Done in Python rather than SQL because the
+    independent-source-count rule isn't a plain COUNT(DISTINCT ...) — result sets here
+    are small enough (bounded by max_domains x discovery limits) that this is simpler
+    and clearer than encoding that rule as SQL.
     """
-    clauses = ["ju.job_id=?"]
+    clauses = ["job_id=?"]
     where_params: list = [job_id]
     if tiers:
         tiers = list(tiers)
-        clauses.append(f"ju.relevance_tier IN ({','.join('?' for _ in tiers)})")
+        clauses.append(f"relevance_tier IN ({','.join('?' for _ in tiers)})")
         where_params.extend(tiers)
-    sql = f"""
-        SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.best_serp_rank,
-               ju.metadata_json,
-               GROUP_CONCAT(DISTINCT jus.source) AS sources,
-               COUNT(DISTINCT jus.source || '::' || COALESCE(jus.source_detail, '')) AS source_count
-        FROM job_urls ju
-        JOIN urls u ON u.id = ju.url_id
-        LEFT JOIN job_url_sources jus ON jus.job_id = ju.job_id AND jus.url_id = ju.url_id
-        WHERE {' AND '.join(clauses)}
-        GROUP BY u.id
-        ORDER BY CASE ju.relevance_tier WHEN 'high' THEN 0 WHEN 'possible' THEN 1 ELSE 2 END,
-                 source_count DESC,
-                 ju.best_serp_rank IS NULL, ju.best_serp_rank ASC,
-                 ju.relevance_score DESC,
-                 u.url ASC
-        LIMIT ? OFFSET ?
-    """
-    params = [*where_params, min(limit, 2000), max(offset, 0)]
+
     with db() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        job_url_rows = conn.execute(
+            f"""
+            SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.best_serp_rank,
+                   ju.metadata_json
+            FROM job_urls ju
+            JOIN urls u ON u.id = ju.url_id
+            WHERE {' AND '.join(f'ju.{c}' for c in clauses)}
+            """,
+            where_params,
+        ).fetchall()
+        source_rows = conn.execute(
+            "SELECT url_id, source, source_detail FROM job_url_sources WHERE job_id=?", (job_id,)
+        ).fetchall()
+
+    provenance_by_url: dict[int, list[tuple[str, str]]] = {}
+    for r in source_rows:
+        provenance_by_url.setdefault(r["url_id"], []).append((r["source"], r["source_detail"]))
+
+    results = []
+    for row in job_url_rows:
+        item = dict(row)
+        pairs = provenance_by_url.get(item["id"], [])
+        item["provenance"] = [{"source": s, "detail": d or None} for s, d in pairs]
+        item["source_count"] = _independent_source_count(pairs)
+        results.append(item)
+
+    tier_order = {"high": 0, "possible": 1}
+    results.sort(
+        key=lambda it: (
+            tier_order.get(it["relevance_tier"], 2),
+            -it["source_count"],
+            it["best_serp_rank"] is None,
+            it["best_serp_rank"] if it["best_serp_rank"] is not None else 0,
+            -it["relevance_score"],
+            it["url"],
+        )
+    )
+    return results[max(offset, 0) : max(offset, 0) + min(limit, 2000)]

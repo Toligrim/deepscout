@@ -76,6 +76,10 @@ def test_add_job_url_and_list_job_urls_with_tier_filter(temp_db):
     assert high_only[0]["best_serp_rank"] == 3
 
 
+def _provenance_pairs(row):
+    return {(p["source"], p["detail"]) for p in row["provenance"]}
+
+
 def test_list_job_urls_reports_this_jobs_own_sources(temp_db):
     job = store.create_job(1, "deep_search", {})
     row = store.upsert_url(1, "https://example.com/a", source="searxng", source_detail="brave")
@@ -85,7 +89,7 @@ def test_list_job_urls_reports_this_jobs_own_sources(temp_db):
     store.add_job_url(job["id"], row["id"], 1.0, "high", 2.0, 1, {})
 
     rows = store.list_job_urls(job["id"])
-    assert set(rows[0]["sources"].split(",")) == {"searxng", "openserp", "wayback"}
+    assert _provenance_pairs(rows[0]) == {("searxng", "brave"), ("openserp", "bing"), ("wayback", None)}
     assert rows[0]["source_count"] == 3
 
 
@@ -110,14 +114,51 @@ def test_job_specific_provenance_does_not_leak_between_jobs(temp_db):
     job_a_rows = store.list_job_urls(job_a["id"])
     job_b_rows = store.list_job_urls(job_b["id"])
 
-    assert job_a_rows[0]["sources"] == "wayback"
-    assert job_b_rows[0]["sources"] == "openserp"  # not "wayback,openserp"
+    assert _provenance_pairs(job_a_rows[0]) == {("wayback", None)}
+    assert _provenance_pairs(job_b_rows[0]) == {("openserp", "bing")}  # not wayback too
 
     # the project-wide provenance still legitimately has both
     conn = sqlite3.connect(store.settings.db_path)
     global_sources = {r[0] for r in conn.execute("SELECT source FROM url_sources WHERE url_id=?", (row["id"],))}
     conn.close()
     assert global_sources == {"wayback", "openserp"}
+
+
+def test_provenance_preserves_all_four_source_engine_pairs(temp_db):
+    """The task's exact scenario: one URL found via OpenSERP/Bing, OpenSERP/DuckDuckGo,
+    SearXNG/Brave, and Wayback — the API result must carry all four pairs, not just an
+    aggregated source list."""
+    job = store.create_job(1, "deep_search", {})
+    row = store.upsert_url(1, "https://example.com/multi", source="searxng", source_detail="brave")
+    store.add_job_url_source(job["id"], row["id"], "openserp", "bing")
+    store.add_job_url_source(job["id"], row["id"], "openserp", "duckduckgo")
+    store.add_job_url_source(job["id"], row["id"], "searxng", "brave")
+    store.add_job_url_source(job["id"], row["id"], "wayback", None)
+    store.add_job_url(job["id"], row["id"], 1.0, "high", 1.0, 1, {})
+
+    rows = store.list_job_urls(job["id"])
+    assert _provenance_pairs(rows[0]) == {
+        ("openserp", "bing"), ("openserp", "duckduckgo"), ("searxng", "brave"), ("wayback", None),
+    }
+
+
+def test_independent_source_count_caps_discovery_collections_at_one(temp_db):
+    """Two Common Crawl collections for the same URL are one independent signal, not
+    two — but two different search engines still count separately. Expected total: 3
+    (Common Crawl once, Bing, DuckDuckGo), not 4."""
+    job = store.create_job(1, "deep_search", {})
+    row = store.upsert_url(1, "https://example.com/cc", source="commoncrawl", source_detail="CC-MAIN-2026-34")
+    store.add_job_url_source(job["id"], row["id"], "commoncrawl", "CC-MAIN-2026-34")
+    store.add_job_url_source(job["id"], row["id"], "commoncrawl", "CC-MAIN-2026-30")
+    store.add_job_url_source(job["id"], row["id"], "openserp", "bing")
+    store.add_job_url_source(job["id"], row["id"], "openserp", "duckduckgo")
+    store.add_job_url(job["id"], row["id"], 1.0, "high", 1.0, None, {})
+
+    rows = store.list_job_urls(job["id"])
+    assert rows[0]["source_count"] == 3
+    # detail is still preserved for both collections, just not double-counted
+    cc_details = {p["detail"] for p in rows[0]["provenance"] if p["source"] == "commoncrawl"}
+    assert cc_details == {"CC-MAIN-2026-34", "CC-MAIN-2026-30"}
 
 
 def test_list_job_urls_sort_order_source_count_then_rank_then_score_then_url(temp_db):

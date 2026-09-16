@@ -314,7 +314,8 @@ def test_url_found_via_four_sources_is_stored_once_with_full_provenance(temp_db,
     rows = store.list_job_urls(job["id"], tiers=None)
     matches = [r for r in rows if r["url"] == "https://example.com/shared"]
     assert len(matches) == 1  # stored once, not 4 times
-    assert set(matches[0]["sources"].split(",")) == {"searxng", "sitemap", "wayback", "commoncrawl"}
+    assert {p["source"] for p in matches[0]["provenance"]} == {"searxng", "sitemap", "wayback", "commoncrawl"}
+    assert matches[0]["source_count"] == 4  # 4 distinct source types, each counted once
 
 
 def test_relevance_tiers_and_progress_counters_are_recorded(temp_db, monkeypatch):
