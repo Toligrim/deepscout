@@ -369,3 +369,8 @@ def local_search(project_id: int = 1, q: str = Query(min_length=1), limit: int =
 @app.get("/api/stats")
 def stats(project_id: int = 1):
     return store.get_stats(project_id)
+
+
+@app.delete("/api/history")
+def clear_history(project_id: int = 1):
+    return store.clear_history(project_id)
