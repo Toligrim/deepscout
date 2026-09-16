@@ -132,6 +132,45 @@ def init_db() -> None:
                 INSERT INTO pages_fts(pages_fts, rowid, title, text) VALUES('delete', old.id, old.title, old.text);
                 INSERT INTO pages_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
             END;
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                progress_json TEXT,
+                result_summary_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id);
+
+            CREATE TABLE IF NOT EXISTS job_urls (
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                url_id INTEGER NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+                relevance_score REAL NOT NULL,
+                relevance_tier TEXT NOT NULL,
+                domain_score REAL,
+                best_serp_rank INTEGER,
+                metadata_json TEXT,
+                PRIMARY KEY(job_id, url_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_urls_job ON job_urls(job_id);
+
+            -- Provenance scoped to one Deep Search run, separate from the project-wide
+            -- url_sources: a URL re-discovered by a later job must not inherit an earlier
+            -- job's sources just because they share the same project-wide urls row.
+            CREATE TABLE IF NOT EXISTS job_url_sources (
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                url_id INTEGER NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                source_detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(job_id, url_id, source, source_detail)
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_url_sources_job ON job_url_sources(job_id);
             """
         )
         row = conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()
@@ -350,3 +389,170 @@ def get_stats(project_id: int) -> dict:
             (project_id,),
         ).fetchall()
         return {"urls": total, "fetched": fetched, "domains": domains, "sources": [dict(r) for r in sources]}
+
+
+def create_job(project_id: int, kind: str, params: dict) -> dict:
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO jobs(project_id, kind, status, params_json, created_at) VALUES (?,?,?,?,?)",
+            (project_id, kind, "queued", json.dumps(params, ensure_ascii=False), utcnow()),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+
+def get_job(job_id: int) -> dict | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+
+_JOB_UPDATE_FIELDS = {"status", "progress_json", "result_summary_json", "error", "started_at", "finished_at"}
+
+
+def update_job(job_id: int, **fields) -> None:
+    if not fields:
+        return
+    unknown = set(fields) - _JOB_UPDATE_FIELDS
+    if unknown:
+        raise ValueError(f"cannot update job field(s): {sorted(unknown)}")
+    cols = ", ".join(f"{key}=?" for key in fields)
+    params = [*fields.values(), job_id]
+    with db() as conn:
+        conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", params)
+
+
+def mark_interrupted_jobs() -> int:
+    """Any job left queued/running across a restart didn't finish cleanly — flip it to
+    'interrupted' rather than leaving it stuck, mirroring how init_db() itself already
+    runs unconditionally on every startup."""
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status='interrupted', finished_at=? WHERE status IN ('queued','running')",
+            (utcnow(),),
+        )
+        return cur.rowcount
+
+
+def add_job_url(
+    job_id: int,
+    url_id: int,
+    relevance_score: float,
+    relevance_tier: str,
+    domain_score: float | None,
+    best_serp_rank: int | None,
+    metadata: dict | None = None,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO job_urls(job_id, url_id, relevance_score, relevance_tier, domain_score, best_serp_rank, metadata_json)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                job_id, url_id, relevance_score, relevance_tier, domain_score, best_serp_rank,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def add_job_url_source(job_id: int, url_id: int, source: str, source_detail: str | None) -> None:
+    """Provenance scoped to this one Deep Search run — see job_url_sources in init_db().
+    Callers also write the same fact to the project-wide url_sources (via upsert_url /
+    add_url_source) separately; this is not a replacement for that, just a job-scoped view.
+
+    source_detail is normalized to '' rather than left NULL: SQL NULL never equals NULL,
+    so two rows differing only by a NULL detail wouldn't be deduplicated by the
+    PRIMARY KEY the way two rows sharing '' reliably are.
+    """
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO job_url_sources(job_id, url_id, source, source_detail) VALUES (?,?,?,?)",
+            (job_id, url_id, source, source_detail or ""),
+        )
+
+
+# Sources whose source_detail names an independent search signal (a distinct engine) —
+# each (source, detail) pair counts separately toward a URL's independent-source count.
+# Discovery sources' detail (a sitemap URL, a Common Crawl collection id) is provenance
+# worth keeping, but multiple sitemaps/collections for the same source are not
+# independent corroboration the way two different search engines are — each discovery
+# source counts at most once no matter how many detail values it produced.
+_ENGINE_LEVEL_SOURCES = {"searxng", "openserp"}
+
+
+def _independent_source_count(pairs: Iterable[tuple[str, str]]) -> int:
+    signals: set = set()
+    for source, detail in pairs:
+        signals.add((source, detail) if source in _ENGINE_LEVEL_SOURCES else source)
+    return len(signals)
+
+
+def list_job_urls(
+    job_id: int,
+    *,
+    tiers: Iterable[str] | None = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> list[dict]:
+    """Results for one Deep Search run. Provenance comes only from job_url_sources —
+    this job's own findings — never from the project-wide url_sources, so an older
+    job's sources can never leak into a newer job's results for a URL both happened to
+    touch. Each row's 'provenance' is the full list of (source, detail) pairs this job
+    found it through; 'source_count' is how many *independent* signals that is (see
+    _independent_source_count — multiple engines count separately, multiple discovery
+    collections/sitemaps for the same source do not).
+
+    Sort order within a tier: source_count (desc), then best SERP rank if it had one
+    (asc, NULLs last), then lexical relevance score (desc), then the URL itself as a
+    final deterministic tie-breaker. Done in Python rather than SQL because the
+    independent-source-count rule isn't a plain COUNT(DISTINCT ...) — result sets here
+    are small enough (bounded by max_domains x discovery limits) that this is simpler
+    and clearer than encoding that rule as SQL.
+    """
+    clauses = ["job_id=?"]
+    where_params: list = [job_id]
+    if tiers:
+        tiers = list(tiers)
+        clauses.append(f"relevance_tier IN ({','.join('?' for _ in tiers)})")
+        where_params.extend(tiers)
+
+    with db() as conn:
+        job_url_rows = conn.execute(
+            f"""
+            SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.best_serp_rank,
+                   ju.metadata_json
+            FROM job_urls ju
+            JOIN urls u ON u.id = ju.url_id
+            WHERE {' AND '.join(f'ju.{c}' for c in clauses)}
+            """,
+            where_params,
+        ).fetchall()
+        source_rows = conn.execute(
+            "SELECT url_id, source, source_detail FROM job_url_sources WHERE job_id=?", (job_id,)
+        ).fetchall()
+
+    provenance_by_url: dict[int, list[tuple[str, str]]] = {}
+    for r in source_rows:
+        provenance_by_url.setdefault(r["url_id"], []).append((r["source"], r["source_detail"]))
+
+    results = []
+    for row in job_url_rows:
+        item = dict(row)
+        pairs = provenance_by_url.get(item["id"], [])
+        item["provenance"] = [{"source": s, "detail": d or None} for s, d in pairs]
+        item["source_count"] = _independent_source_count(pairs)
+        results.append(item)
+
+    tier_order = {"high": 0, "possible": 1}
+    results.sort(
+        key=lambda it: (
+            tier_order.get(it["relevance_tier"], 2),
+            -it["source_count"],
+            it["best_serp_rank"] is None,
+            it["best_serp_rank"] if it["best_serp_rank"] is not None else 0,
+            -it["relevance_score"],
+            it["url"],
+        )
+    )
+    return results[max(offset, 0) : max(offset, 0) + min(limit, 2000)]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from .. import db as store
 from ..utils import normalize_url
 from .openserp import OpenSerpProvider
 from .providers import SearchProvider, SearchResponse
@@ -57,6 +58,22 @@ def _score(best_rank: int, engine_count: int, backend_count: int, searxng_score:
     if searxng_score:
         s += 0.1 * searxng_score
     return s
+
+
+def persist_merged_result(project_id: int, m: MergedResult) -> dict | None:
+    """Store one merged SERP result plus every (backend, engine) provenance row it
+    carries. Shared by /api/search and Deep Search's SERP phase so this upsert
+    pattern lives in exactly one place."""
+    primary_backend, primary_engine = m.contributions[0] if m.contributions else (m.backends[0], None)
+    row = store.upsert_url(
+        project_id, m.canonical_url, source=primary_backend, source_detail=primary_engine,
+        title=m.title, snippet=m.snippet,
+    )
+    if not row:
+        return None
+    for backend, engine in m.contributions[1:]:
+        store.add_url_source(project_id, row["id"], backend, engine)
+    return row
 
 
 async def run_search(

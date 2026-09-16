@@ -13,6 +13,7 @@ class Settings:
     timeout: float = float(os.getenv("DEEPSCOUT_TIMEOUT", "20"))
     openserp_timeout: float = float(os.getenv("DEEPSCOUT_OPENSERP_TIMEOUT", "35"))
     search_health_cache_seconds: float = float(os.getenv("DEEPSCOUT_HEALTH_CACHE_SECONDS", "30"))
+    deep_search_concurrency: int = int(os.getenv("DEEPSCOUT_DEEP_SEARCH_CONCURRENCY", "4"))
     user_agent: str = os.getenv(
         "DEEPSCOUT_USER_AGENT",
         "DeepScout/0.1 (+self-hosted research tool)",

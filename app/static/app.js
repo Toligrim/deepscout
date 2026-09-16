@@ -113,8 +113,9 @@ async function loadSourcesHealth() {
 }
 loadSourcesHealth();
 
-function quoteSearch(text) { $$('.tab')[0].click(); $('#query').value = `"${text.replaceAll('"','')}"`; $('#query').focus(); }
-function deepDomain(domain) { $$('.tab')[1].click(); $('#domainInput').value = domain; currentDomain = domain; $('#domainInput').focus(); }
+function goToTab(tab) { document.querySelector(`.tab[data-tab="${tab}"]`).click(); }
+function quoteSearch(text) { goToTab('search'); $('#query').value = `"${text.replaceAll('"','')}"`; $('#query').focus(); }
+function deepDomain(domain) { goToTab('domain'); $('#domainInput').value = domain; currentDomain = domain; $('#domainInput').focus(); }
 $('#searchResults').addEventListener('click', e => {
   const domainBtn = e.target.closest('.action-domain'); if(domainBtn) return deepDomain(domainBtn.dataset.domain);
   const fetchBtn = e.target.closest('.action-fetch'); if(fetchBtn) return fetchAndRead(fetchBtn.dataset.url);
@@ -175,3 +176,106 @@ async function refreshStats(){
   try{const s=await api('/api/stats?project_id='+projectId); $('#stats').innerHTML=`<div class="stat"><b>${s.urls}</b><span>URL</span></div><div class="stat"><b>${s.domains}</b><span>доменов</span></div><div class="stat"><b>${s.fetched}</b><span>скачано</span></div>` + s.sources.slice(0,5).map(x=>`<div class="stat"><b>${x.n}</b><span>${esc(x.source)}</span></div>`).join('');}catch{}
 }
 loadProjects();
+
+// --- Deep Search -------------------------------------------------------------
+
+const DS_PHASE_LABELS = {
+  queued: 'В очереди', searching: 'Ищу по SERP', selecting_domains: 'Выбираю домены',
+  discovering: 'Исследую домены', scoring: 'Оцениваю релевантность', done: 'Готово',
+};
+const DS_COUNTER_LABELS = {
+  serp_raw: 'SERP raw', serp_unique: 'SERP уникальных', domains_selected: 'доменов',
+  sitemap_urls: 'sitemap', wayback_urls: 'wayback', commoncrawl_urls: 'common crawl',
+  unique_urls: 'всего уникальных', high_relevance: 'high', possible_relevance: 'possible',
+  discovered_relevance: 'discovered',
+};
+let dsEventSource = null;
+
+function selectedDsSources() { return $$('input[name=dsSource]:checked').map(x => x.value); }
+
+function renderDsCounters(counters) {
+  if (!counters) { $('#dsCounters').innerHTML = ''; return; }
+  $('#dsCounters').innerHTML = Object.entries(DS_COUNTER_LABELS)
+    .map(([key, label]) => `<div class="stat"><b>${counters[key] ?? 0}</b><span>${esc(label)}</span></div>`).join('');
+}
+
+$('#deepSearchForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const q = $('#dsQuery').value.trim(); if (!q) return;
+  if (dsEventSource) { dsEventSource.close(); dsEventSource = null; }
+  $('#dsResults').innerHTML = ''; $('#dsLog').textContent = ''; renderDsCounters(null);
+  status($('#dsStatus'), 'Запускаю…');
+  try {
+    const data = await api('/api/deep-search', {method: 'POST', body: JSON.stringify({
+      project_id: projectId, query: q,
+      max_serp_results: Number($('#dsMaxSerp').value) || 50,
+      max_domains: Number($('#dsMaxDomains').value) || 10,
+      limit_per_source: Number($('#dsLimitPerSource').value) || 100,
+      sources: selectedDsSources(),
+    })});
+    watchDeepSearch(data.job_id);
+  } catch (err) { status($('#dsStatus'), err.message, 'error'); }
+});
+
+function watchDeepSearch(jobId) {
+  status($('#dsStatus'), 'Запущено, слежу за прогрессом…');
+  dsEventSource = new EventSource(`/api/deep-search/${jobId}/events`);
+  dsEventSource.addEventListener('progress', e => {
+    const data = JSON.parse(e.data);
+    const p = data.progress || {};
+    status($('#dsStatus'), DS_PHASE_LABELS[p.phase] || p.phase || '');
+    renderDsCounters(p.counters);
+    let logText = (p.log || []).join('\n');
+    if (p.warnings && p.warnings.length) logText += '\n\n⚠ ' + p.warnings.join('\n⚠ ');
+    $('#dsLog').textContent = logText;
+  });
+  dsEventSource.addEventListener('done', async e => {
+    const data = JSON.parse(e.data);
+    dsEventSource.close(); dsEventSource = null;
+    const label = {completed: 'Готово', partial: 'Готово частично', failed: 'Не удалось'}[data.status] || data.status;
+    status($('#dsStatus'), label + (data.error ? `: ${data.error}` : ''), data.status === 'failed' ? 'error' : (data.status === 'completed' ? 'good' : ''));
+    if (data.result_summary) renderDsCounters(data.result_summary.counters);
+    await loadDsResults(jobId);
+  });
+}
+
+async function loadDsResults(jobId) {
+  $('#dsResults').dataset.jobId = jobId;
+  const tiers = $('#dsTierFilter').value;
+  try {
+    const rows = await api(`/api/deep-search/${jobId}/results?` + new URLSearchParams({tiers}));
+    $('#dsResults').innerHTML = rows.map(renderDsCard).join('') || '<div class="muted">Ничего не найдено.</div>';
+  } catch (err) { $('#dsResults').innerHTML = `<div class="status error">${esc(err.message)}</div>`; }
+}
+$('#dsTierFilter').addEventListener('change', () => { const jobId = $('#dsResults').dataset.jobId; if (jobId) loadDsResults(jobId); });
+
+const DS_ENGINE_LEVEL_SOURCES = new Set(['searxng', 'openserp']);
+function provenanceChipLabels(provenance) {
+  // openserp/bing and openserp/duckduckgo are independent search signals worth
+  // showing separately; multiple sitemap URLs or Common Crawl collections for the
+  // same discovery source are not (see _independent_source_count server-side) — so
+  // those collapse into a single "sitemap"/"wayback"/"commoncrawl" chip.
+  const labels = new Set();
+  (provenance || []).forEach(p => {
+    labels.add(DS_ENGINE_LEVEL_SOURCES.has(p.source) && p.detail ? `${p.source} · ${p.detail}` : p.source);
+  });
+  return [...labels];
+}
+
+function renderDsCard(r) {
+  const sources = provenanceChipLabels(r.provenance);
+  return `<article class="card">
+    <div class="card-title"><span class="tier-chip tier-${esc(r.relevance_tier)}">${esc(r.relevance_tier)}</span><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a></div>
+    <div class="url">${esc(r.url)}</div>
+    <div class="snippet">${esc(r.snippet || '')}</div>
+    <div class="engine-row">${sources.map(s => `<span class="chip">${esc(s)}</span>`).join('')}<span class="chip">${esc(r.kind)}</span></div>
+    <div class="card-actions">
+      <button class="mini action-domain" data-domain="${esc(r.domain)}">Исследовать домен</button>
+      <button class="mini action-fetch" data-url="${esc(r.url)}">Текст + ссылки</button>
+    </div>
+  </article>`;
+}
+$('#dsResults').addEventListener('click', e => {
+  const domainBtn = e.target.closest('.action-domain'); if (domainBtn) return deepDomain(domainBtn.dataset.domain);
+  const fetchBtn = e.target.closest('.action-fetch'); if (fetchBtn) return fetchAndRead(fetchBtn.dataset.url);
+});
