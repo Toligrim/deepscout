@@ -156,19 +156,31 @@ embeddings, nothing that "decides" beyond the rules documented here.
                 + 0.1 * min(url_count_in_serp, 5)
                 + 0.3 * distinct_engine_count
                 + 0.5 * (found through more than one backend)
+                + 0.3 * domain_query_relevance
    ```
 
-   Sorted descending, ties broken by domain name. Every selected domain's score and its inputs
-   (best rank, URL count, engines, backends) are saved in the job's result summary, so you can
-   see *why* a domain made the cut.
+   `domain_query_relevance` is the best (max) lexical relevance score (see step 4) among the
+   domain's own SERP URLs — a small, bounded nudge (max +0.3, well under what the SERP-signal
+   terms alone commonly add up to) against a domain that only looks strong because one engine
+   returned a lot of noise for a generic query. It never excludes a domain outright — a domain
+   with zero lexical relevance can still make Top N on SERP corroboration alone, it just loses a
+   modest edge against genuinely on-topic competitors. This was validated against a real run: for
+   `raspberry pi gpio documentation`, a strongly-corroborated but off-topic domain (a Dutch
+   retailer, `intratuin.nl`) dropped from a would-be #2 to #3, correctly ceding a spot to
+   `github.com`, while still not being excluded — exactly the intended effect. Sorted descending,
+   ties broken by domain name. Every selected domain's score and its inputs (best rank, URL
+   count, engines, backends, `domain_query_relevance`) are saved in the job's result summary, so
+   you can see *why* a domain made the cut.
 3. **Discovery** — for each selected domain, the existing `discover_sitemaps` / `discover_wayback`
-   / `discover_commoncrawl` (same functions and limits Domain Explorer uses), one `(domain,
-   source)` call at a time bounded by an internal concurrency limit (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`,
-   default 4) so a big Deep Search doesn't hammer Wayback/Common Crawl or the Pi itself. Each
-   source failing for a domain is isolated to that one `(domain, source)` pair — it never aborts
-   the others. **Live Crawl is not offered here** — it stays a Domain Explorer-only, explicitly
-   opt-in action; automatically crawling sites as a side effect of a Deep Search wasn't something
-   this feature should do without you asking for that domain specifically.
+   / `discover_commoncrawl` (same functions and limits Domain Explorer uses). `(domain, source)`
+   calls are isolated from each other and bounded by **one process-global** concurrency limit
+   (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`, default 4) — shared across every Deep Search job running
+   in the process at once, not per job, so N simultaneous jobs still can't exceed the configured
+   total load on Wayback/Common Crawl/the Pi itself. A source failing for a domain is isolated to
+   that one `(domain, source)` pair — it never aborts the others. **Live Crawl is not offered
+   here** — it stays a Domain Explorer-only, explicitly opt-in action; automatically crawling
+   sites as a side effect of a Deep Search wasn't something this feature should do without you
+   asking for that domain specifically.
 4. **Relevance** — every URL touched by the job (SERP and discovered alike) gets scored against
    the query with a cheap lexical matcher, never a fetch: tokens are lowercased and split on
    anything non-alphanumeric (Unicode-aware, so this works the same for Cyrillic queries), then
@@ -177,14 +189,22 @@ embeddings, nothing that "decides" beyond the rules documented here.
    `score >= 0.6` → **high**, `0 < score < 0.6` → **possible**, `score == 0` → **discovered**. A
    URL is *never* dropped for scoring 0 — that's the whole point of a discovery tool, it just
    sorts last.
-5. **Merge** — one row per URL in a new `job_urls` table (relevance score/tier, and the score of
-   the domain it came from) linking to the same `urls`/`url_sources` rows everything else in
-   DeepScout already uses — no separate URL store, and a URL found by e.g. both an engine and
-   Wayback keeps every source's provenance.
+5. **Merge** — one row per URL in `job_urls` (relevance score/tier, the score of the domain it
+   came from, and its best SERP rank if it had one) linking to the same `urls`/`url_sources` rows
+   everything else in DeepScout already uses — no separate URL store. Provenance for *this job* is
+   tracked separately in `job_url_sources` (job_id + url_id + source + source_detail) — distinct
+   from the project-wide, cross-job `url_sources` table. This matters because a URL is a
+   project-wide entity: if an earlier Deep Search found it via Wayback and a later one re-finds
+   the same URL only via OpenSERP/Bing, the later job's results must show only OpenSERP/Bing, not
+   inherit Wayback from a run that has nothing to do with it. `url_sources` still gets the same
+   writes as always (nothing about the project-wide provenance changes) — `job_url_sources` is an
+   additional, job-scoped view on top.
 
-**Sort order** shown to you: tier first (high → possible → discovered), then within a tier: found
-through more independent sources, then better SERP rank, then the lexical score itself, then the
-URL string as a final deterministic tie-breaker.
+**Sort order** shown to you: tier first (high → possible → discovered), then within a tier — how
+many independent sources *this specific job* found the URL through (desc, computed live from
+`job_url_sources`, not stored redundantly), then its best SERP rank if it had one (asc, URLs with
+no SERP rank at all — pure discovery finds — sort after any real rank), then the lexical relevance
+score (desc), then the URL string as a final deterministic tie-breaker.
 
 **Job status**: `failed` only if the whole pipeline produced zero usable results (or an actual
 internal bug aborted it); `partial` if there's at least one usable result but something also
@@ -194,12 +214,15 @@ Deep Search — you still get everything that did work, with the failure listed 
 
 **API**: `POST /api/deep-search` returns `{"job_id": ...}` immediately; the pipeline runs as a
 background `asyncio` task (SQLite + asyncio only — no Redis/Celery, appropriate for a
-single-Raspberry-Pi deployment). `GET /api/deep-search/{id}` returns a JSON snapshot (status,
-progress, result summary). `GET /api/deep-search/{id}/results?tiers=high,possible` (or
-`tiers=all`) lists the found URLs. `GET /api/deep-search/{id}/events` streams progress over
-**SSE** — a real `text/event-stream`, but its data source is simply polling the same `jobs` row
-once a second rather than a purpose-built pub/sub broadcaster: the database row stays the single
-source of truth, more than one browser tab watching the same job works for free, and a server
+single-Raspberry-Pi deployment). Unknown `sources` values are rejected with `400` (listing which
+ones), not silently dropped — a typo like `"waybak"` shouldn't quietly turn into "ignored".
+`GET /api/deep-search/{id}` returns a JSON snapshot (status, progress, result summary).
+`GET /api/deep-search/{id}/results?tiers=high,possible` (or `tiers=all`) lists the found URLs —
+scoped to the job's own project automatically (read from the job row server-side; there's no
+client-supplied `project_id` to trust here). `GET /api/deep-search/{id}/events` streams progress
+over **SSE** — a real `text/event-stream`, but its data source is simply polling the same `jobs`
+row once a second rather than a purpose-built pub/sub broadcaster: the database row stays the
+single source of truth, more than one browser tab watching the same job works for free, and a server
 restart mid-job is trivially recoverable (the client just reconnects and immediately sees whatever
 the row currently says — nothing to replay). If the server does restart mid-job, that job is
 marked `interrupted` on the next startup rather than left stuck as `running` forever.
@@ -237,7 +260,7 @@ Interactive OpenAPI docs are available at `/docs`.
 
 ## Politeness and limits
 
-DeepScout is intended for research, not aggressive crawling. Live crawl obeys robots.txt when it can be retrieved, stays on the selected domain, and is deliberately capped. Wayback and Common Crawl are queried through public indexes; keep per-source limits reasonable. Deep Search additionally bounds how many `(domain, source)` discovery calls run at once (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`, default 4) so a large run doesn't hammer Wayback/Common Crawl or the sites being discovered.
+DeepScout is intended for research, not aggressive crawling. Live crawl obeys robots.txt when it can be retrieved, stays on the selected domain, and is deliberately capped. Wayback and Common Crawl are queried through public indexes; keep per-source limits reasonable. Deep Search additionally bounds how many `(domain, source)` discovery calls run at once across the whole process (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`, default 4, shared by every Deep Search job running at the same time — not 4 per job) so a large run, or several at once, doesn't hammer Wayback/Common Crawl or the sites being discovered.
 
 ## Current limitations
 

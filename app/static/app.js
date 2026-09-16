@@ -243,14 +243,14 @@ async function loadDsResults(jobId) {
   $('#dsResults').dataset.jobId = jobId;
   const tiers = $('#dsTierFilter').value;
   try {
-    const rows = await api(`/api/deep-search/${jobId}/results?` + new URLSearchParams({project_id: String(projectId), tiers}));
+    const rows = await api(`/api/deep-search/${jobId}/results?` + new URLSearchParams({tiers}));
     $('#dsResults').innerHTML = rows.map(renderDsCard).join('') || '<div class="muted">Ничего не найдено.</div>';
   } catch (err) { $('#dsResults').innerHTML = `<div class="status error">${esc(err.message)}</div>`; }
 }
 $('#dsTierFilter').addEventListener('change', () => { const jobId = $('#dsResults').dataset.jobId; if (jobId) loadDsResults(jobId); });
 
 function renderDsCard(r) {
-  const sources = (r.backends || '').split(',').filter(Boolean);
+  const sources = (r.sources || '').split(',').filter(Boolean);
   return `<article class="card">
     <div class="card-title"><span class="tier-chip tier-${esc(r.relevance_tier)}">${esc(r.relevance_tier)}</span><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || r.url)}</a></div>
     <div class="url">${esc(r.url)}</div>

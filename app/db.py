@@ -154,10 +154,23 @@ def init_db() -> None:
                 relevance_score REAL NOT NULL,
                 relevance_tier TEXT NOT NULL,
                 domain_score REAL,
+                best_serp_rank INTEGER,
                 metadata_json TEXT,
                 PRIMARY KEY(job_id, url_id)
             );
             CREATE INDEX IF NOT EXISTS idx_job_urls_job ON job_urls(job_id);
+
+            -- Provenance scoped to one Deep Search run, separate from the project-wide
+            -- url_sources: a URL re-discovered by a later job must not inherit an earlier
+            -- job's sources just because they share the same project-wide urls row.
+            CREATE TABLE IF NOT EXISTS job_url_sources (
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                url_id INTEGER NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                source_detail TEXT,
+                PRIMARY KEY(job_id, url_id, source, source_detail)
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_url_sources_job ON job_url_sources(job_id);
             """
         )
         row = conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()
@@ -427,26 +440,50 @@ def add_job_url(
     relevance_score: float,
     relevance_tier: str,
     domain_score: float | None,
+    best_serp_rank: int | None,
     metadata: dict | None = None,
 ) -> None:
     with db() as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO job_urls(job_id, url_id, relevance_score, relevance_tier, domain_score, metadata_json)
-            VALUES (?,?,?,?,?,?)
+            INSERT OR IGNORE INTO job_urls(job_id, url_id, relevance_score, relevance_tier, domain_score, best_serp_rank, metadata_json)
+            VALUES (?,?,?,?,?,?,?)
             """,
-            (job_id, url_id, relevance_score, relevance_tier, domain_score, json.dumps(metadata or {}, ensure_ascii=False)),
+            (
+                job_id, url_id, relevance_score, relevance_tier, domain_score, best_serp_rank,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+
+
+def add_job_url_source(job_id: int, url_id: int, source: str, source_detail: str | None) -> None:
+    """Provenance scoped to this one Deep Search run — see job_url_sources in init_db().
+    Callers also write the same fact to the project-wide url_sources (via upsert_url /
+    add_url_source) separately; this is not a replacement for that, just a job-scoped view."""
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO job_url_sources(job_id, url_id, source, source_detail) VALUES (?,?,?,?)",
+            (job_id, url_id, source, source_detail),
         )
 
 
 def list_job_urls(
     job_id: int,
-    project_id: int,
     *,
     tiers: Iterable[str] | None = None,
     limit: int = 500,
     offset: int = 0,
 ) -> list[dict]:
+    """Results for one Deep Search run. Provenance ('sources'/'source_count') comes only
+    from job_url_sources — this job's own findings — never from the project-wide
+    url_sources, so an older job's sources can never leak into a newer job's results for
+    a URL both happened to touch.
+
+    Sort order within a tier: how many independent sources *this job* found the URL
+    through (desc), then its best SERP rank if it had one (asc, NULLs last), then the
+    lexical relevance score (desc), then the URL itself as a final deterministic
+    tie-breaker.
+    """
     clauses = ["ju.job_id=?"]
     where_params: list = [job_id]
     if tiers:
@@ -454,19 +491,23 @@ def list_job_urls(
         clauses.append(f"ju.relevance_tier IN ({','.join('?' for _ in tiers)})")
         where_params.extend(tiers)
     sql = f"""
-        SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.metadata_json,
-               GROUP_CONCAT(DISTINCT us.source) AS backends,
-               GROUP_CONCAT(DISTINCT us.source_detail) AS engines
+        SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.best_serp_rank,
+               ju.metadata_json,
+               GROUP_CONCAT(DISTINCT jus.source) AS sources,
+               COUNT(DISTINCT jus.source || '::' || COALESCE(jus.source_detail, '')) AS source_count
         FROM job_urls ju
         JOIN urls u ON u.id = ju.url_id
-        LEFT JOIN url_sources us ON us.url_id = u.id AND us.project_id=?
+        LEFT JOIN job_url_sources jus ON jus.job_id = ju.job_id AND jus.url_id = ju.url_id
         WHERE {' AND '.join(clauses)}
         GROUP BY u.id
         ORDER BY CASE ju.relevance_tier WHEN 'high' THEN 0 WHEN 'possible' THEN 1 ELSE 2 END,
-                 ju.relevance_score DESC, u.url ASC
+                 source_count DESC,
+                 ju.best_serp_rank IS NULL, ju.best_serp_rank ASC,
+                 ju.relevance_score DESC,
+                 u.url ASC
         LIMIT ? OFFSET ?
     """
-    params = [project_id, *where_params, min(limit, 2000), max(offset, 0)]
+    params = [*where_params, min(limit, 2000), max(offset, 0)]
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]

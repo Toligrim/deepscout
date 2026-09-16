@@ -181,6 +181,14 @@ def test_deep_search_rejects_invalid_sources(client):
     assert resp.status_code == 400
 
 
+def test_deep_search_rejects_a_typo_source_even_alongside_valid_ones(client):
+    # a typo like "waybak" must not be silently dropped just because "wayback" is
+    # also present -- strict validation, not "ignore anything unrecognized"
+    resp = client.post("/api/deep-search", json={"project_id": 1, "query": "q", "sources": ["wayback", "waybak"]})
+    assert resp.status_code == 400
+    assert "waybak" in resp.json()["detail"]
+
+
 def test_deep_search_job_not_found_returns_404(client):
     assert client.get("/api/deep-search/999999").status_code == 404
     assert client.get("/api/deep-search/999999/results").status_code == 404
@@ -207,12 +215,43 @@ def test_deep_search_results_endpoint_filters_by_tier(client, monkeypatch):
     job_id = client.post("/api/deep-search", json={"project_id": 1, "query": "bgp"}).json()["job_id"]
     _wait_for_terminal(client, job_id)
 
-    high = client.get(f"/api/deep-search/{job_id}/results", params={"project_id": 1}).json()
+    high = client.get(f"/api/deep-search/{job_id}/results").json()
     assert len(high) == 1
     assert high[0]["url"] == "https://example.com/bgp"
 
-    everything = client.get(f"/api/deep-search/{job_id}/results", params={"project_id": 1, "tiers": "all"}).json()
+    everything = client.get(f"/api/deep-search/{job_id}/results", params={"tiers": "all"}).json()
     assert len(everything) == 1
+
+
+def test_deep_search_results_uses_the_jobs_own_project_not_a_client_supplied_one(client, monkeypatch):
+    other_project = client.post("/api/projects", json={"name": "Other project"}).json()
+
+    async def fake_run_search(query, **kwargs):
+        return AggregatedSearchResponse(
+            query=query,
+            results=[
+                MergedResult(
+                    canonical_url="https://example.com/bgp", title="BGP", snippet="s",
+                    backends=["searxng"], engines=["brave"], best_rank=1, score=1.0,
+                    contributions=[("searxng", "brave")],
+                )
+            ],
+            backends={"searxng": {"status": "ok", "count": 1, "error": None}}, warnings=[],
+        )
+
+    monkeypatch.setattr(deep_search, "run_search", fake_run_search)
+    for source in ("sitemap", "wayback", "commoncrawl"):
+        monkeypatch.setitem(deep_search._SOURCE_CALLS, source, AsyncMock(return_value=[]))
+
+    job_id = client.post("/api/deep-search", json={"project_id": other_project["id"], "query": "bgp"}).json()["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    # no project_id in the request at all -- the endpoint has no such parameter anymore,
+    # it must resolve the project from the job itself and still return the right rows
+    results = client.get(f"/api/deep-search/{job_id}/results").json()
+    assert len(results) == 1
+    assert results[0]["url"] == "https://example.com/bgp"
+    assert client.get(f"/api/deep-search/{job_id}").json()["project_id"] == other_project["id"]
 
 
 def test_deep_search_events_stream_reports_terminal_status(client, monkeypatch):

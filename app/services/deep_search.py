@@ -62,30 +62,65 @@ def _push(job_id: int, progress: Progress) -> None:
     store.update_job(job_id, progress_json=progress.to_json())
 
 
-def score_domain(urls: list[MergedResult]) -> tuple[float, dict]:
-    """Deterministic, documented, unit-tested — the four factors the spec named:
-    best (lowest) rank any of the domain's URLs achieved, how many of its URLs made
-    the SERP cut, and how many distinct engines/backends corroborated it.
+# A process-global gate on discovery concurrency, shared by every Deep Search job
+# running in this process — not one Semaphore per job (which would let N concurrent
+# jobs each run DEEPSCOUT_DEEP_SEARCH_CONCURRENCY discovery calls, N times the intended
+# total load). Lazily created against whatever event loop is currently running: a
+# Semaphore created before the loop exists (e.g. at import time) — or on a now-dead
+# loop from a previous asyncio.run() in tests — can't be awaited safely, so this
+# recreates it whenever the running loop differs from the one it was built for. In
+# production (one persistent uvicorn worker, one long-lived loop) this still means:
+# created once, reused by every job for the process's whole lifetime.
+_global_semaphore: asyncio.Semaphore | None = None
+_global_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_global_semaphore() -> asyncio.Semaphore:
+    global _global_semaphore, _global_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _global_semaphore is None or _global_semaphore_loop is not loop:
+        _global_semaphore = asyncio.Semaphore(max(settings.deep_search_concurrency, 1))
+        _global_semaphore_loop = loop
+    return _global_semaphore
+
+
+def score_domain(urls: list[MergedResult], query: str) -> tuple[float, dict]:
+    """Deterministic, documented, unit-tested — the four SERP-signal factors plus one
+    small lexical check: best (lowest) rank any of the domain's URLs achieved, how many
+    of its URLs made the SERP cut, how many distinct engines/backends corroborated it,
+    and how well the domain's own best SERP hit actually matches the query lexically.
 
     score = 1/best_rank + 0.1*min(url_count, 5) + 0.3*distinct_engines + 0.5*(backends > 1)
+          + 0.3*domain_query_relevance
+
+    The lexical term is intentionally small (max +0.3, vs. the SERP corroboration terms
+    which commonly add up to 1+) — it's a tiebreak-strength nudge against a domain that
+    only looks strong because one engine returned a lot of noise, not a veto. A domain
+    is never excluded just because domain_query_relevance is 0; it only loses a small
+    edge against otherwise-similar competitors.
     """
     best_rank = min(u.best_rank for u in urls)
     engines = sorted({e for u in urls for e in u.engines})
     backends = sorted({b for u in urls for b in u.backends})
     url_count = len(urls)
+    domain_query_relevance = max(
+        (score_relevance(query, u.canonical_url, u.title, u.snippet).score for u in urls), default=0.0
+    )
     score = 1.0 / max(best_rank, 1) + 0.1 * min(url_count, 5) + 0.3 * len(engines)
     score += 0.5 if len(backends) > 1 else 0.0
+    score += 0.3 * domain_query_relevance
     explanation = {
         "best_rank": best_rank,
         "url_count": url_count,
         "engines": engines,
         "backends": backends,
+        "domain_query_relevance": round(domain_query_relevance, 4),
     }
     return round(score, 4), explanation
 
 
 def select_domains(
-    results: list[MergedResult], max_domains: int
+    results: list[MergedResult], max_domains: int, query: str
 ) -> list[tuple[str, float, dict, list[MergedResult]]]:
     by_domain: dict[str, list[MergedResult]] = {}
     for m in results:
@@ -97,7 +132,7 @@ def select_domains(
 
     scored = []
     for domain, urls in by_domain.items():
-        score, explanation = score_domain(urls)
+        score, explanation = score_domain(urls, query)
         scored.append((domain, score, explanation, urls))
     # deterministic: score desc, ties broken by domain name so re-runs on the same
     # input always produce the same Top N in the same order
@@ -128,11 +163,12 @@ async def _run_discovery(
     for item in items:
         url = item.get("url", "")
         status = item.get("status")
+        source_detail = item.get("source_detail") or item.get("collection")
         row = store.upsert_url(
             project_id,
             url,
             source=source,
-            source_detail=item.get("source_detail") or item.get("collection"),
+            source_detail=source_detail,
             mime=item.get("mime"),
             live_status=int(status) if str(status or "").isdigit() else None,
         )
@@ -145,7 +181,14 @@ async def _run_discovery(
                 int(status) if str(status or "").isdigit() else None,
                 item.get("mime"), item.get("digest"), item.get("raw") or item,
             )
-        discovered[row["url"]] = {"url_id": row["id"], "title": row["title"], "snippet": row["snippet"]}
+        store.add_job_url_source(job_id, row["id"], source, source_detail)
+        # a URL discovery finds again after already appearing in SERP keeps its SERP
+        # rank — discovery itself carries no ranking signal, so it must never clear one
+        previous_rank = discovered.get(row["url"], {}).get("best_serp_rank")
+        discovered[row["url"]] = {
+            "url_id": row["id"], "title": row["title"], "snippet": row["snippet"],
+            "best_serp_rank": previous_rank,
+        }
 
     progress.counters[f"{source}_urls"] += accepted
     if error:
@@ -187,8 +230,14 @@ async def run_deep_search_job(job_id: int, project_id: int, query: str, params: 
         discovered: dict[str, dict] = {}
         for m in kept:
             row = persist_merged_result(project_id, m)
-            if row:
-                discovered[row["url"]] = {"url_id": row["id"], "title": row["title"], "snippet": row["snippet"]}
+            if not row:
+                continue
+            for backend, engine in m.contributions:
+                store.add_job_url_source(job_id, row["id"], backend, engine)
+            discovered[row["url"]] = {
+                "url_id": row["id"], "title": row["title"], "snippet": row["snippet"],
+                "best_serp_rank": m.best_rank,
+            }
 
         progress.note(f"{progress.counters['serp_raw']} SERP results, {progress.counters['serp_unique']} unique")
         _push(job_id, progress)
@@ -198,7 +247,7 @@ async def run_deep_search_job(job_id: int, project_id: int, query: str, params: 
         progress.note("Selecting domains")
         _push(job_id, progress)
 
-        domains = select_domains(kept, params["max_domains"])
+        domains = select_domains(kept, params["max_domains"], query)
         progress.counters["domains_selected"] = len(domains)
         progress.note(f"{len(domains)} domains selected")
         _push(job_id, progress)
@@ -207,7 +256,7 @@ async def run_deep_search_job(job_id: int, project_id: int, query: str, params: 
         progress.phase = "discovering"
         sources = params["sources"]
         if domains and sources:
-            semaphore = asyncio.Semaphore(max(settings.deep_search_concurrency, 1))
+            semaphore = _get_global_semaphore()
             await asyncio.gather(
                 *(
                     _run_discovery(
@@ -234,7 +283,7 @@ async def run_deep_search_job(job_id: int, project_id: int, query: str, params: 
             result = score_relevance(query, url, info.get("title"), info.get("snippet"))
             store.add_job_url(
                 job_id, info["url_id"], result.score, result.tier,
-                domain_scores.get(domain), {"query": query},
+                domain_scores.get(domain), info.get("best_serp_rank"), {"query": query},
             )
             progress.counters["unique_urls"] += 1
             progress.counters[f"{result.tier}_relevance"] += 1

@@ -173,9 +173,12 @@ def _job_view(job: dict) -> dict:
 
 @app.post("/api/deep-search")
 async def create_deep_search(payload: DeepSearchRequest):
-    sources = [s for s in payload.sources if s in ALLOWED_SOURCES]
+    unknown = [s for s in payload.sources if s not in ALLOWED_SOURCES]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown source(s): {', '.join(unknown)}")
+    sources = payload.sources
     if not sources:
-        raise HTTPException(status_code=400, detail="No valid sources selected")
+        raise HTTPException(status_code=400, detail="No sources selected")
     params = {
         "max_serp_results": payload.max_serp_results,
         "max_domains": payload.max_domains,
@@ -201,15 +204,17 @@ def get_deep_search(job_id: int):
 @app.get("/api/deep-search/{job_id}/results")
 def get_deep_search_results(
     job_id: int,
-    project_id: int = 1,
     tiers: str = "high,possible",
     limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
 ):
+    # project_id is deliberately not accepted from the client — the job already knows
+    # which project it belongs to, and trusting a client-supplied value here would let
+    # one project's results be requested under another project's id.
     if not store.get_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
     tier_list = None if tiers.strip().lower() == "all" else [t.strip() for t in tiers.split(",") if t.strip()]
-    return store.list_job_urls(job_id, project_id, tiers=tier_list, limit=limit, offset=offset)
+    return store.list_job_urls(job_id, tiers=tier_list, limit=limit, offset=offset)
 
 
 _TERMINAL_JOB_STATUSES = {"completed", "partial", "failed", "cancelled", "interrupted"}

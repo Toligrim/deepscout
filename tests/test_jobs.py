@@ -60,30 +60,96 @@ def test_mark_interrupted_jobs_flips_queued_and_running_only(temp_db):
 def test_add_job_url_and_list_job_urls_with_tier_filter(temp_db):
     job = store.create_job(1, "deep_search", {})
     row = store.upsert_url(1, "https://example.com/bgp", source="sitemap", source_detail=None, title="BGP guide")
-    store.add_job_url(job["id"], row["id"], 0.9, "high", 1.5, {"note": "test"})
+    store.add_job_url(job["id"], row["id"], 0.9, "high", 1.5, 3, {"note": "test"})
 
     row2 = store.upsert_url(1, "https://example.com/about", source="sitemap", source_detail=None, title="About")
-    store.add_job_url(job["id"], row2["id"], 0.0, "discovered", 1.5, {})
+    store.add_job_url(job["id"], row2["id"], 0.0, "discovered", 1.5, None, {})
 
-    all_rows = store.list_job_urls(job["id"], 1, tiers=None)
+    all_rows = store.list_job_urls(job["id"], tiers=None)
     assert len(all_rows) == 2
 
-    high_only = store.list_job_urls(job["id"], 1, tiers=["high"])
+    high_only = store.list_job_urls(job["id"], tiers=["high"])
     assert len(high_only) == 1
     assert high_only[0]["url"] == "https://example.com/bgp"
     assert high_only[0]["relevance_score"] == 0.9
     assert high_only[0]["domain_score"] == 1.5
+    assert high_only[0]["best_serp_rank"] == 3
 
 
-def test_list_job_urls_includes_provenance_backends(temp_db):
+def test_list_job_urls_reports_this_jobs_own_sources(temp_db):
     job = store.create_job(1, "deep_search", {})
     row = store.upsert_url(1, "https://example.com/a", source="searxng", source_detail="brave")
-    store.add_url_source(1, row["id"], "openserp", "bing")
-    store.add_url_source(1, row["id"], "wayback", None)
-    store.add_job_url(job["id"], row["id"], 1.0, "high", 2.0, {})
+    store.add_job_url_source(job["id"], row["id"], "searxng", "brave")
+    store.add_job_url_source(job["id"], row["id"], "openserp", "bing")
+    store.add_job_url_source(job["id"], row["id"], "wayback", None)
+    store.add_job_url(job["id"], row["id"], 1.0, "high", 2.0, 1, {})
 
-    rows = store.list_job_urls(job["id"], 1)
-    assert set(rows[0]["backends"].split(",")) == {"searxng", "openserp", "wayback"}
+    rows = store.list_job_urls(job["id"])
+    assert set(rows[0]["sources"].split(",")) == {"searxng", "openserp", "wayback"}
+    assert rows[0]["source_count"] == 3
+
+
+def test_job_specific_provenance_does_not_leak_between_jobs(temp_db):
+    """The regression the task asked for: Job A finds a URL via Wayback, Job B later
+    finds the same URL only via OpenSERP/Bing — Job B's results must show only
+    OpenSERP/Bing, even though the shared url_sources row now has both."""
+    row = store.upsert_url(1, "https://example.com/shared", source="wayback", source_detail=None)
+
+    job_a = store.create_job(1, "deep_search", {})
+    store.add_job_url_source(job_a["id"], row["id"], "wayback", None)
+    store.add_job_url(job_a["id"], row["id"], 0.5, "possible", 1.0, None, {})
+
+    # a second, unrelated project search re-finds the same URL through OpenSERP/Bing,
+    # which also lands in the shared, project-wide url_sources table
+    store.add_url_source(1, row["id"], "openserp", "bing")
+
+    job_b = store.create_job(1, "deep_search", {})
+    store.add_job_url_source(job_b["id"], row["id"], "openserp", "bing")
+    store.add_job_url(job_b["id"], row["id"], 0.9, "high", 1.0, 1, {})
+
+    job_a_rows = store.list_job_urls(job_a["id"])
+    job_b_rows = store.list_job_urls(job_b["id"])
+
+    assert job_a_rows[0]["sources"] == "wayback"
+    assert job_b_rows[0]["sources"] == "openserp"  # not "wayback,openserp"
+
+    # the project-wide provenance still legitimately has both
+    conn = sqlite3.connect(store.settings.db_path)
+    global_sources = {r[0] for r in conn.execute("SELECT source FROM url_sources WHERE url_id=?", (row["id"],))}
+    conn.close()
+    assert global_sources == {"wayback", "openserp"}
+
+
+def test_list_job_urls_sort_order_source_count_then_rank_then_score_then_url(temp_db):
+    """source_count DESC -> best_serp_rank ASC (NULLs last) -> relevance_score DESC -> url ASC,
+    all within the same tier."""
+    job = store.create_job(1, "deep_search", {})
+
+    def add(url, *, sources, rank, score):
+        row = store.upsert_url(1, url, source="sitemap", source_detail=None)
+        for i, src in enumerate(sources):
+            store.add_job_url_source(job["id"], row["id"], src, f"detail{i}")
+        store.add_job_url(job["id"], row["id"], score, "high", None, rank, {})
+        return row
+
+    # z.example: 2 sources, rank 5 -> loses to y.example (2 sources, rank 3) on rank
+    add("https://z.example/", sources=["sitemap", "wayback"], rank=5, score=0.9)
+    add("https://y.example/", sources=["sitemap", "wayback"], rank=3, score=0.7)
+    # x.example: only 1 source -> ranks below both, even though its score is highest
+    add("https://x.example/", sources=["sitemap"], rank=1, score=0.99)
+    # w.example: 2 sources, no SERP rank at all (discovery-only) -> NULL rank sorts last
+    add("https://w.example/", sources=["sitemap", "commoncrawl"], rank=None, score=0.95)
+    # v.example: same source_count and rank as y.example, lower score -> loses on score
+    add("https://v.example/", sources=["sitemap", "wayback"], rank=3, score=0.6)
+
+    rows = store.list_job_urls(job["id"], tiers=["high"])
+    assert [r["url"] for r in rows] == [
+        "https://y.example/",  # 2 sources, rank 3, score 0.7
+        "https://v.example/",  # 2 sources, rank 3, score 0.6 (loses to y on score)
+        "https://z.example/",  # 2 sources, rank 5 (a real rank still beats NULL)
+        "https://w.example/",  # 2 sources, rank NULL -- sorts after any real rank
+        "https://x.example/",  # 1 source only -- last regardless of its high score
+    ]
 
 
 def test_jobs_migration_compatible_with_pre_existing_old_schema_db(tmp_path, monkeypatch):
