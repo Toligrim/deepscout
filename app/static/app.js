@@ -175,6 +175,15 @@ $('#localSearchForm').addEventListener('submit', async e => {
 async function refreshStats(){
   try{const s=await api('/api/stats?project_id='+projectId); $('#stats').innerHTML=`<div class="stat"><b>${s.urls}</b><span>URL</span></div><div class="stat"><b>${s.domains}</b><span>доменов</span></div><div class="stat"><b>${s.fetched}</b><span>скачано</span></div>` + s.sources.slice(0,5).map(x=>`<div class="stat"><b>${x.n}</b><span>${esc(x.source)}</span></div>`).join('');}catch{}
 }
+
+$('#clearHistoryBtn').addEventListener('click', async () => {
+  if(!confirm('Удалить историю поиска (запросы и задачи глубокого поиска) в этом проекте? Сами найденные URL и скачанные страницы останутся.')) return;
+  try{
+    const r = await api('/api/history?project_id='+projectId, {method:'DELETE'});
+    status($('#clearHistoryStatus'), `Удалено: ${r.queries_deleted} запросов, ${r.jobs_deleted} задач.`, 'good');
+  } catch(err){ status($('#clearHistoryStatus'), err.message, 'error'); }
+});
+
 loadProjects();
 
 // --- Deep Search -------------------------------------------------------------

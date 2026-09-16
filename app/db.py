@@ -422,6 +422,19 @@ def update_job(job_id: int, **fields) -> None:
         conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", params)
 
 
+def clear_history(project_id: int) -> dict:
+    """Delete this project's search history: past queries and Deep Search jobs.
+
+    Jobs cascade-delete their job_urls/job_url_sources rows (ON DELETE CASCADE);
+    the discovered urls/pages/url_sources themselves are untouched — this clears
+    the record of *searches run*, not the research library built from them.
+    """
+    with db() as conn:
+        queries_deleted = conn.execute("DELETE FROM queries WHERE project_id=?", (project_id,)).rowcount
+        jobs_deleted = conn.execute("DELETE FROM jobs WHERE project_id=?", (project_id,)).rowcount
+        return {"queries_deleted": queries_deleted, "jobs_deleted": jobs_deleted}
+
+
 def mark_interrupted_jobs() -> int:
     """Any job left queued/running across a restart didn't finish cleanly — flip it to
     'interrupted' rather than leaving it stuck, mirroring how init_db() itself already
