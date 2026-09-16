@@ -10,6 +10,10 @@ The goal is not to replace a search engine. The goal is to make poorly indexed p
   parallel, are deduplicated and ranked deterministically, and every result keeps full
   backend/engine provenance. One backend failing (or an engine hitting CAPTCHA/429) never fails
   the whole request — see [Search backends](#search-backends) below.
+- Deep Search — a deterministic background job that takes a Search, picks the most promising
+  domains out of the results, and expands each one through Sitemap/Wayback/Common Crawl, scored
+  against your query with cheap lexical matching and merged into one deduplicated result set —
+  see [Deep Search](#deep-search) below.
 - Domain Explorer with independent discovery providers:
   - sitemap.xml and sitemap indexes;
   - robots.txt Sitemap declarations;
@@ -132,6 +136,74 @@ reason (`CAPTCHA`, `blocked`, `rate_limited`, `timeout`, …) — never a raw st
 Common Crawl reachability are reported separately, under `discovery`, since they aren't SERP
 engines.
 
+### Deep Search
+
+Normal Search answers "what do search engines think is relevant right now?" Deep Search answers
+"what else exists around this topic that a plain search wouldn't surface?" — it's the same query,
+expanded automatically into the domains it points at, using the archival/structural sources
+Domain Explorer already offers, one level deep. It's a fully deterministic pipeline — no LLM, no
+embeddings, nothing that "decides" beyond the rules documented here.
+
+**Pipeline**, all against the existing app code, nothing reimplemented:
+
+1. **SERP** — the same `run_search()` multi-backend Search uses, top `max_serp_results` kept
+   (default 50, max 200).
+2. **Domain selection** — group the kept SERP results by domain, score each one, keep the top
+   `max_domains` (default 10, max 25):
+
+   ```
+   domain_score = 1/best_rank_of_any_url_in_domain
+                + 0.1 * min(url_count_in_serp, 5)
+                + 0.3 * distinct_engine_count
+                + 0.5 * (found through more than one backend)
+   ```
+
+   Sorted descending, ties broken by domain name. Every selected domain's score and its inputs
+   (best rank, URL count, engines, backends) are saved in the job's result summary, so you can
+   see *why* a domain made the cut.
+3. **Discovery** — for each selected domain, the existing `discover_sitemaps` / `discover_wayback`
+   / `discover_commoncrawl` (same functions and limits Domain Explorer uses), one `(domain,
+   source)` call at a time bounded by an internal concurrency limit (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`,
+   default 4) so a big Deep Search doesn't hammer Wayback/Common Crawl or the Pi itself. Each
+   source failing for a domain is isolated to that one `(domain, source)` pair — it never aborts
+   the others. **Live Crawl is not offered here** — it stays a Domain Explorer-only, explicitly
+   opt-in action; automatically crawling sites as a side effect of a Deep Search wasn't something
+   this feature should do without you asking for that domain specifically.
+4. **Relevance** — every URL touched by the job (SERP and discovered alike) gets scored against
+   the query with a cheap lexical matcher, never a fetch: tokens are lowercased and split on
+   anything non-alphanumeric (Unicode-aware, so this works the same for Cyrillic queries), then
+   for each query token the best match location decides its weight — the URL/path/filename itself
+   (1.0), the title (0.6), or the snippet (0.3) — averaged into a 0..1 score.
+   `score >= 0.6` → **high**, `0 < score < 0.6` → **possible**, `score == 0` → **discovered**. A
+   URL is *never* dropped for scoring 0 — that's the whole point of a discovery tool, it just
+   sorts last.
+5. **Merge** — one row per URL in a new `job_urls` table (relevance score/tier, and the score of
+   the domain it came from) linking to the same `urls`/`url_sources` rows everything else in
+   DeepScout already uses — no separate URL store, and a URL found by e.g. both an engine and
+   Wayback keeps every source's provenance.
+
+**Sort order** shown to you: tier first (high → possible → discovered), then within a tier: found
+through more independent sources, then better SERP rank, then the lexical score itself, then the
+URL string as a final deterministic tie-breaker.
+
+**Job status**: `failed` only if the whole pipeline produced zero usable results (or an actual
+internal bug aborted it); `partial` if there's at least one usable result but something also
+logged a problem (a degraded SERP backend, a failed discovery call); `completed` only if nothing
+anywhere reported an issue. A single domain's Common Crawl call timing out does not fail your
+Deep Search — you still get everything that did work, with the failure listed separately.
+
+**API**: `POST /api/deep-search` returns `{"job_id": ...}` immediately; the pipeline runs as a
+background `asyncio` task (SQLite + asyncio only — no Redis/Celery, appropriate for a
+single-Raspberry-Pi deployment). `GET /api/deep-search/{id}` returns a JSON snapshot (status,
+progress, result summary). `GET /api/deep-search/{id}/results?tiers=high,possible` (or
+`tiers=all`) lists the found URLs. `GET /api/deep-search/{id}/events` streams progress over
+**SSE** — a real `text/event-stream`, but its data source is simply polling the same `jobs` row
+once a second rather than a purpose-built pub/sub broadcaster: the database row stays the single
+source of truth, more than one browser tab watching the same job works for free, and a server
+restart mid-job is trivially recoverable (the client just reconnects and immediately sees whatever
+the row currently says — nothing to replay). If the server does restart mid-job, that job is
+marked `interrupted` on the next startup rather than left stuck as `running` forever.
+
 ### Domain Explorer
 
 Enter a domain and select discovery providers. DeepScout runs them independently; one provider can fail without aborting the others. Results can be filtered by substring, source, and document type.
@@ -151,6 +223,10 @@ The `База` tab searches only content that you explicitly fetched. This is us
 - `POST /api/projects`
 - `POST /api/search`
 - `GET /api/search/health`
+- `POST /api/deep-search`
+- `GET /api/deep-search/{job_id}`
+- `GET /api/deep-search/{job_id}/results`
+- `GET /api/deep-search/{job_id}/events` (SSE)
 - `POST /api/discover/domain`
 - `POST /api/fetch`
 - `GET /api/urls`
@@ -161,11 +237,12 @@ Interactive OpenAPI docs are available at `/docs`.
 
 ## Politeness and limits
 
-DeepScout is intended for research, not aggressive crawling. Live crawl obeys robots.txt when it can be retrieved, stays on the selected domain, and is deliberately capped. Wayback and Common Crawl are queried through public indexes; keep per-source limits reasonable.
+DeepScout is intended for research, not aggressive crawling. Live crawl obeys robots.txt when it can be retrieved, stays on the selected domain, and is deliberately capped. Wayback and Common Crawl are queried through public indexes; keep per-source limits reasonable. Deep Search additionally bounds how many `(domain, source)` discovery calls run at once (`DEEPSCOUT_DEEP_SEARCH_CONCURRENCY`, default 4) so a large run doesn't hammer Wayback/Common Crawl or the sites being discovered.
 
 ## Current limitations
 
-- Discovery jobs currently run in the request process instead of a persistent job queue.
+- Domain Explorer's discovery still runs synchronously in the request (no progress/job model);
+  Deep Search has both, Domain Explorer doesn't need them at its smaller single-domain scale yet.
 - Wayback queries use a single bounded request; very large domains will later need resume-key pagination.
 - Common Crawl uses the latest collection only.
 - JS-only pages are not rendered yet; a Playwright fallback is planned.
@@ -173,11 +250,16 @@ DeepScout is intended for research, not aggressive crawling. Live crawl obeys ro
 - OpenSERP's own multi-engine query (`/mega/search`) can take 15-20s end to end when several
   engines are slow/CAPTCHA'd, since DeepScout only reports what actually happened — it doesn't
   cut a slow engine short. With both backends enabled by default, a normal Search can occasionally
-  take noticeably longer than SearXNG alone did in v0.1.
+  take noticeably longer than SearXNG alone did in v0.1. Deep Search inherits the same tradeoff
+  for its own SERP phase.
+- Deep Search's domain scoring only knows what the SERP told it — a generic/ambiguous query can
+  occasionally pull in an unrelated high-traffic domain alongside the relevant ones (observed
+  during testing). It's not filtered out post-hoc; the relevance scoring on its actual pages
+  downgrades it instead of hiding it.
 
 ## Roadmap
 
-1. Streaming discovery progress with SSE.
+1. Streaming progress for Domain Explorer too (Deep Search already has it).
 2. Wayback resume-key pagination and multiple Common Crawl collections.
 3. PDF text extraction and document preview.
 4. Playwright fallback for JavaScript-heavy pages.

@@ -19,6 +19,7 @@
   <main>
     <nav class="tabs" aria-label="Разделы">
       <button class="tab active" data-tab="search">Поиск</button>
+      <button class="tab" data-tab="deepsearch">Глубокий поиск</button>
       <button class="tab" data-tab="domain">Домен</button>
       <button class="tab" data-tab="library">База</button>
     </nav>
@@ -52,6 +53,42 @@
       </div>
       <div id="searchStatus" class="status"></div>
       <div id="searchResults" class="cards"></div>
+    </section>
+
+    <section id="deepsearch" class="panel">
+      <div class="section-head">
+        <div>
+          <h1>Глубокий поиск</h1>
+          <p>Поиск + автоматическое исследование доменов через Sitemap, Wayback и Common Crawl.</p>
+        </div>
+      </div>
+      <form id="deepSearchForm" class="search-form">
+        <input id="dsQuery" type="search" placeholder="Например: российские CDN BGP routing" autocomplete="off" required>
+        <button type="submit" class="primary">Глубокий поиск</button>
+      </form>
+      <details class="engine-picker ds-advanced">
+        <summary class="muted">Дополнительно</summary>
+        <div class="filters-row">
+          <label class="inline">SERP <input id="dsMaxSerp" type="number" value="50" min="1" max="200"></label>
+          <label class="inline">Домены <input id="dsMaxDomains" type="number" value="10" min="1" max="25"></label>
+          <label class="inline">Лимит/источник <input id="dsLimitPerSource" type="number" value="100" min="1" max="1000"></label>
+        </div>
+        <div class="source-grid">
+          <label><input type="checkbox" name="dsSource" value="sitemap" checked> Sitemap</label>
+          <label><input type="checkbox" name="dsSource" value="wayback" checked> Wayback</label>
+          <label><input type="checkbox" name="dsSource" value="commoncrawl" checked> Common Crawl</label>
+        </div>
+      </details>
+      <div id="dsStatus" class="status"></div>
+      <div id="dsCounters" class="summary-grid"></div>
+      <div id="dsLog" class="ds-log muted"></div>
+      <div class="table-toolbar ds-toolbar">
+        <select id="dsTierFilter">
+          <option value="high,possible">High + possible</option>
+          <option value="all">Показать все</option>
+        </select>
+      </div>
+      <div id="dsResults" class="cards"></div>
     </section>
 
     <section id="domain" class="panel">
