@@ -132,6 +132,32 @@ def init_db() -> None:
                 INSERT INTO pages_fts(pages_fts, rowid, title, text) VALUES('delete', old.id, old.title, old.text);
                 INSERT INTO pages_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
             END;
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                progress_json TEXT,
+                result_summary_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id);
+
+            CREATE TABLE IF NOT EXISTS job_urls (
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                url_id INTEGER NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+                relevance_score REAL NOT NULL,
+                relevance_tier TEXT NOT NULL,
+                domain_score REAL,
+                metadata_json TEXT,
+                PRIMARY KEY(job_id, url_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_urls_job ON job_urls(job_id);
             """
         )
         row = conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()
@@ -350,3 +376,97 @@ def get_stats(project_id: int) -> dict:
             (project_id,),
         ).fetchall()
         return {"urls": total, "fetched": fetched, "domains": domains, "sources": [dict(r) for r in sources]}
+
+
+def create_job(project_id: int, kind: str, params: dict) -> dict:
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO jobs(project_id, kind, status, params_json, created_at) VALUES (?,?,?,?,?)",
+            (project_id, kind, "queued", json.dumps(params, ensure_ascii=False), utcnow()),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+
+def get_job(job_id: int) -> dict | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+
+_JOB_UPDATE_FIELDS = {"status", "progress_json", "result_summary_json", "error", "started_at", "finished_at"}
+
+
+def update_job(job_id: int, **fields) -> None:
+    if not fields:
+        return
+    unknown = set(fields) - _JOB_UPDATE_FIELDS
+    if unknown:
+        raise ValueError(f"cannot update job field(s): {sorted(unknown)}")
+    cols = ", ".join(f"{key}=?" for key in fields)
+    params = [*fields.values(), job_id]
+    with db() as conn:
+        conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", params)
+
+
+def mark_interrupted_jobs() -> int:
+    """Any job left queued/running across a restart didn't finish cleanly — flip it to
+    'interrupted' rather than leaving it stuck, mirroring how init_db() itself already
+    runs unconditionally on every startup."""
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status='interrupted', finished_at=? WHERE status IN ('queued','running')",
+            (utcnow(),),
+        )
+        return cur.rowcount
+
+
+def add_job_url(
+    job_id: int,
+    url_id: int,
+    relevance_score: float,
+    relevance_tier: str,
+    domain_score: float | None,
+    metadata: dict | None = None,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO job_urls(job_id, url_id, relevance_score, relevance_tier, domain_score, metadata_json)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (job_id, url_id, relevance_score, relevance_tier, domain_score, json.dumps(metadata or {}, ensure_ascii=False)),
+        )
+
+
+def list_job_urls(
+    job_id: int,
+    project_id: int,
+    *,
+    tiers: Iterable[str] | None = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> list[dict]:
+    clauses = ["ju.job_id=?"]
+    where_params: list = [job_id]
+    if tiers:
+        tiers = list(tiers)
+        clauses.append(f"ju.relevance_tier IN ({','.join('?' for _ in tiers)})")
+        where_params.extend(tiers)
+    sql = f"""
+        SELECT u.*, ju.relevance_score, ju.relevance_tier, ju.domain_score, ju.metadata_json,
+               GROUP_CONCAT(DISTINCT us.source) AS backends,
+               GROUP_CONCAT(DISTINCT us.source_detail) AS engines
+        FROM job_urls ju
+        JOIN urls u ON u.id = ju.url_id
+        LEFT JOIN url_sources us ON us.url_id = u.id AND us.project_id=?
+        WHERE {' AND '.join(clauses)}
+        GROUP BY u.id
+        ORDER BY CASE ju.relevance_tier WHEN 'high' THEN 0 WHEN 'possible' THEN 1 ELSE 2 END,
+                 ju.relevance_score DESC, u.url ASC
+        LIMIT ? OFFSET ?
+    """
+    params = [project_id, *where_params, min(limit, 2000), max(offset, 0)]
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]

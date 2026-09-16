@@ -1,7 +1,8 @@
+import time
 from unittest.mock import AsyncMock
 
 from app import main as app_main
-from app.services import aggregation
+from app.services import aggregation, deep_search
 from app.services.aggregation import AggregatedSearchResponse, MergedResult
 from app.services.providers import SearchResponse
 
@@ -146,3 +147,86 @@ def test_search_never_calls_health_or_extra_probe_requests(client, monkeypatch):
     openserp_health.assert_not_awaited()
     searxng_search.assert_awaited_once()
     openserp_search.assert_awaited_once()
+
+
+def _wait_for_terminal(client, job_id, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = client.get(f"/api/deep-search/{job_id}").json()
+        if data["status"] not in {"queued", "running"}:
+            return data
+        time.sleep(0.05)
+    raise AssertionError("job did not reach a terminal status in time")
+
+
+def test_deep_search_create_and_poll_to_completion(client, monkeypatch):
+    async def fake_run_search(query, **kwargs):
+        return AggregatedSearchResponse(query=query, results=[], backends={}, warnings=[])
+
+    monkeypatch.setattr(deep_search, "run_search", fake_run_search)
+    for source in ("sitemap", "wayback", "commoncrawl"):
+        monkeypatch.setitem(deep_search._SOURCE_CALLS, source, AsyncMock(return_value=[]))
+
+    resp = client.post("/api/deep-search", json={"project_id": 1, "query": "bgp routing"})
+    assert resp.status_code == 200
+    job_id = resp.json()["job_id"]
+
+    final = _wait_for_terminal(client, job_id)
+    assert final["status"] == "failed"  # zero SERP results, zero discovery -> nothing usable
+    assert final["result_summary"]["counters"]["unique_urls"] == 0
+
+
+def test_deep_search_rejects_invalid_sources(client):
+    resp = client.post("/api/deep-search", json={"project_id": 1, "query": "q", "sources": ["live_crawl"]})
+    assert resp.status_code == 400
+
+
+def test_deep_search_job_not_found_returns_404(client):
+    assert client.get("/api/deep-search/999999").status_code == 404
+    assert client.get("/api/deep-search/999999/results").status_code == 404
+
+
+def test_deep_search_results_endpoint_filters_by_tier(client, monkeypatch):
+    async def fake_run_search(query, **kwargs):
+        return AggregatedSearchResponse(
+            query=query,
+            results=[
+                MergedResult(
+                    canonical_url="https://example.com/bgp", title="BGP", snippet="s",
+                    backends=["searxng"], engines=["brave"], best_rank=1, score=1.0,
+                    contributions=[("searxng", "brave")],
+                )
+            ],
+            backends={"searxng": {"status": "ok", "count": 1, "error": None}}, warnings=[],
+        )
+
+    monkeypatch.setattr(deep_search, "run_search", fake_run_search)
+    for source in ("sitemap", "wayback", "commoncrawl"):
+        monkeypatch.setitem(deep_search._SOURCE_CALLS, source, AsyncMock(return_value=[]))
+
+    job_id = client.post("/api/deep-search", json={"project_id": 1, "query": "bgp"}).json()["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    high = client.get(f"/api/deep-search/{job_id}/results", params={"project_id": 1}).json()
+    assert len(high) == 1
+    assert high[0]["url"] == "https://example.com/bgp"
+
+    everything = client.get(f"/api/deep-search/{job_id}/results", params={"project_id": 1, "tiers": "all"}).json()
+    assert len(everything) == 1
+
+
+def test_deep_search_events_stream_reports_terminal_status(client, monkeypatch):
+    async def fake_run_search(query, **kwargs):
+        return AggregatedSearchResponse(query=query, results=[], backends={}, warnings=[])
+
+    monkeypatch.setattr(deep_search, "run_search", fake_run_search)
+    for source in ("sitemap", "wayback", "commoncrawl"):
+        monkeypatch.setitem(deep_search._SOURCE_CALLS, source, AsyncMock(return_value=[]))
+
+    job_id = client.post("/api/deep-search", json={"project_id": 1, "query": "q"}).json()["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    with client.stream("GET", f"/api/deep-search/{job_id}/events") as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+    assert "event: done" in body

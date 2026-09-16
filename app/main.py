@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db as store
 from .config import settings
-from .services.aggregation import run_search
+from .services.aggregation import persist_merged_result, run_search
+from .services.deep_search import ALLOWED_SOURCES, DEFAULT_SOURCES, run_deep_search_job
 from .services.discovery import (
     discover_commoncrawl,
     discover_live_crawl,
@@ -21,6 +23,11 @@ from .services.discovery import (
 from .services.fetcher import fetch_page
 from .services.health import get_search_health
 from .utils import normalize_domain
+
+# Deep Search jobs run as fire-and-forget asyncio.create_task()s; keeping a strong
+# reference here stops them from being garbage-collected mid-run (a well-known asyncio
+# gotcha for tasks nothing else holds onto).
+_background_tasks: set[asyncio.Task] = set()
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -57,9 +64,19 @@ class FetchRequest(BaseModel):
     url: str
 
 
+class DeepSearchRequest(BaseModel):
+    project_id: int = 1
+    query: str = Field(min_length=1, max_length=1000)
+    max_serp_results: int = Field(default=50, ge=1, le=200)
+    max_domains: int = Field(default=10, ge=1, le=25)
+    limit_per_source: int = Field(default=100, ge=1, le=1000)
+    sources: list[str] = list(DEFAULT_SOURCES)
+
+
 @app.on_event("startup")
 def startup() -> None:
     store.init_db()
+    store.mark_interrupted_jobs()
 
 
 @app.get("/")
@@ -105,19 +122,9 @@ async def web_search(payload: SearchRequest):
 
     stored = []
     for m in aggregated.results:
-        primary_backend, primary_engine = m.contributions[0] if m.contributions else (m.backends[0], None)
-        row = store.upsert_url(
-            payload.project_id,
-            m.canonical_url,
-            source=primary_backend,
-            source_detail=primary_engine,
-            title=m.title,
-            snippet=m.snippet,
-        )
+        row = persist_merged_result(payload.project_id, m)
         if not row:
             continue
-        for backend, engine in m.contributions[1:]:
-            store.add_url_source(payload.project_id, row["id"], backend, engine)
         stored.append(
             {
                 "url": m.canonical_url,
@@ -147,6 +154,86 @@ async def web_search(payload: SearchRequest):
 @app.get("/api/search/health")
 async def search_health(refresh: bool = False):
     return await get_search_health(force=refresh)
+
+
+def _job_view(job: dict) -> dict:
+    return {
+        "id": job["id"],
+        "project_id": job["project_id"],
+        "kind": job["kind"],
+        "status": job["status"],
+        "progress": json.loads(job["progress_json"]) if job["progress_json"] else None,
+        "result_summary": json.loads(job["result_summary_json"]) if job["result_summary_json"] else None,
+        "error": job["error"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+    }
+
+
+@app.post("/api/deep-search")
+async def create_deep_search(payload: DeepSearchRequest):
+    sources = [s for s in payload.sources if s in ALLOWED_SOURCES]
+    if not sources:
+        raise HTTPException(status_code=400, detail="No valid sources selected")
+    params = {
+        "max_serp_results": payload.max_serp_results,
+        "max_domains": payload.max_domains,
+        "limit_per_source": payload.limit_per_source,
+        "sources": sources,
+        "query": payload.query,
+    }
+    job = store.create_job(payload.project_id, "deep_search", params)
+    task = asyncio.create_task(run_deep_search_job(job["id"], payload.project_id, payload.query, params))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"job_id": job["id"]}
+
+
+@app.get("/api/deep-search/{job_id}")
+def get_deep_search(job_id: int):
+    job = store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return _job_view(job)
+
+
+@app.get("/api/deep-search/{job_id}/results")
+def get_deep_search_results(
+    job_id: int,
+    project_id: int = 1,
+    tiers: str = "high,possible",
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+):
+    if not store.get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    tier_list = None if tiers.strip().lower() == "all" else [t.strip() for t in tiers.split(",") if t.strip()]
+    return store.list_job_urls(job_id, project_id, tiers=tier_list, limit=limit, offset=offset)
+
+
+_TERMINAL_JOB_STATUSES = {"completed", "partial", "failed", "cancelled", "interrupted"}
+
+
+@app.get("/api/deep-search/{job_id}/events")
+async def deep_search_events(job_id: int):
+    async def stream():
+        last_snapshot = None
+        while True:
+            job = store.get_job(job_id)
+            if job is None:
+                yield f"event: error\ndata: {json.dumps({'detail': 'job not found'})}\n\n"
+                return
+            snapshot = json.dumps({"status": job["status"], "progress": _job_view(job)["progress"]}, ensure_ascii=False)
+            if snapshot != last_snapshot:
+                yield f"event: progress\ndata: {snapshot}\n\n"
+                last_snapshot = snapshot
+            if job["status"] in _TERMINAL_JOB_STATUSES:
+                yield f"event: done\ndata: {json.dumps(_job_view(job), ensure_ascii=False)}\n\n"
+                return
+            await asyncio.sleep(1)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/api/discover/domain")
